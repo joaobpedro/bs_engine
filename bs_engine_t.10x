@@ -29,23 +29,44 @@
 			<AdditionalIncludePath>C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\winrt</AdditionalIncludePath>
 			<AdditionalIncludePath>C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\cppwinrt</AdditionalIncludePath>
 			<AdditionalIncludePath>C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\include\um</AdditionalIncludePath>
+			<AdditionalIncludePath>C:\Users\joao\source\SDL3-3.4.2\include\</AdditionalIncludePath>
+			<AdditionalIncludePath>C:\Users\joao\source\bs_engine_t\imgui\</AdditionalIncludePath>
 		</AdditionalIncludePaths>
 		<Defines></Defines>
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>build.bat</BuildCommand>
+				<BuildCommand>.\build_win32.bat</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
 				<BuildWorkingDirectory></BuildWorkingDirectory>
 				<FileSyntaxCheckCommand></FileSyntaxCheckCommand>
 				<CancelBuild></CancelBuild>
-				<Exe>main.exe</Exe>
+				<Exe>.\Debug\bs_engine.exe</Exe>
 				<Args></Args>
 				<WorkingDirectory></WorkingDirectory>
-				<DebugCommand>main.exe</DebugCommand>
+				<DebugCommand>$(Executable)</DebugCommand>
 				<DebuggerExe>devenv $(Executable)</DebuggerExe>
+				<DebugSln></DebugSln>
+				<Defines></Defines>
+				<ForceIncludes></ForceIncludes>
+				<PrioritiseFiles></PrioritiseFiles>
+			</ConfigAndPlatform>
+			<ConfigAndPlatform>
+				<Name>Release:x64</Name>
+				<BuildCommand>release_build_win32.bat</BuildCommand>
+				<RebuildCommand></RebuildCommand>
+				<BuildFileCommand></BuildFileCommand>
+				<CleanCommand></CleanCommand>
+				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<FileSyntaxCheckCommand></FileSyntaxCheckCommand>
+				<CancelBuild></CancelBuild>
+				<Exe></Exe>
+				<Args></Args>
+				<WorkingDirectory>$(WorkspaceDirectory)</WorkingDirectory>
+				<DebugCommand>$(Executable)</DebugCommand>
+				<DebuggerExe></DebuggerExe>
 				<DebugSln></DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
@@ -53,6 +74,10 @@
 			</ConfigAndPlatform>
 			<Config>
 				<Name>Debug</Name>
+				<Defines></Defines>
+			</Config>
+			<Config>
+				<Name>Release</Name>
 				<Defines></Defines>
 			</Config>
 			<Platform>
