@@ -1,5 +1,6 @@
+@REM Build for Visual Studio compiler. Run your copy of vcvars32.bat or vcvarsall.bat to setup command-line compiler.
 @set OUT_DIR=Release
-@set OUT_EXE=bs_engine
+@set OUT_EXE=bend_stiffner_calculator
 @set SDL3_DIR=C:\Users\joao\source\SDL3-3.4.2
 @set INCLUDES=/I.\imgui /I.\imgui\backends /I%SDL3_DIR%\include
 @set SOURCES=main.cpp .\imgui\backends\imgui_impl_sdl3.cpp .\imgui\backends\imgui_impl_sdlrenderer3.cpp .\imgui\imgui*.cpp .\imgui\implot*.cpp

@@ -47,33 +47,33 @@ bool solve(float target_angle, BendStiffner &bs, Vec1<Vec1<float>> &results, Vec
     
     while (target_angle > angle)
     {
-        for (int i = 0; i < 20; i++)
+        //for (int i = 0; i < 20; i++)
+        //{
+        Vec1<Vec1<float>> temp_results(DISCRETIZATION);
+            
+        m0_v0_guessed = solve_bvp(bs, DISCRETIZATION, y0, theta0, ml, angle, guessed_m0, guessed_v0, strain);
+        float m0 = m0_v0_guessed.x;
+        float v0 = m0_v0_guessed.y;
+            
+        Vec1<float> y(NUMBER_OF_STATES);
+        y.append(y0);
+        y.append(theta0);
+        y.append(m0);
+        y.append(v0);
+            
+        float x = 0.0;
+        float h = bs.length / (float) DISCRETIZATION;
+            
+        for (size_t i = 0; i < DISCRETIZATION; i++)
         {
-            Vec1<Vec1<float>> temp_results(DISCRETIZATION);
-            
-            m0_v0_guessed = solve_bvp(bs, DISCRETIZATION, y0, theta0, ml, angle, guessed_m0, guessed_v0, strain);
-            float m0 = m0_v0_guessed.x;
-            float v0 = m0_v0_guessed.y;
-            
-            Vec1<float> y(NUMBER_OF_STATES);
-            y.append(y0);
-            y.append(theta0);
-            y.append(m0);
-            y.append(v0);
-            
-            float x = 0.0;
-            float h = bs.length / (float) DISCRETIZATION;
-            
-            for (size_t i = 0; i < DISCRETIZATION; i++)
-            {
-                y = RK4(x, y, h, bs, strain.items[i]);
-                temp_results.items[i] = y;
-                x += h;
-            }
-            
-            calculate_strain(DISCRETIZATION, bs, temp_results, strain);
-            results = temp_results;
+            y = RK4(x, y, h, bs, strain.items[i]);
+            temp_results.items[i] = y;
+            x += h;
         }
+            
+        calculate_strain(DISCRETIZATION, bs, temp_results, strain);
+        results = temp_results;
+        //}
         
         angle += 0.01; // increment the applied angle
     };
@@ -149,8 +149,8 @@ int main ()
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
     // Bend stiffner problem declarations
     BendStiffner bs = { 0 };
-    float target_angle_deg;
-    float target_angle;
+    float target_angle_deg = 0.0;
+    float target_angle = 0.0;
     
     
     // variable to store results, both initalized to zeros
