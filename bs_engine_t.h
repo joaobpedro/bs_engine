@@ -333,5 +333,6 @@ void calculate_strain(size_t steps,
         strain.items[i] = (get_dia(bs, x) * results.items[i].items[2]) / EI;
         strain.count = count;
         count++;
+        x += h;
     }
 };
