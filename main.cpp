@@ -86,6 +86,13 @@ bool solve(float target_angle, BendStiffner &bs, Vec1<Vec1<float>> &results, Vec
         printf("%f\n", strain.items[i]);
     };
     
+    // print the moment
+    printf("Bending Moment:\n");
+    for (size_t i = 0; i < DISCRETIZATION; i++)
+    {
+        printf("%f\n", results.items[i].items[2]);
+    }
+    
     std::chrono::duration<double, std::milli> elapsed = end - start;
     std::cout << "Execution time: " << elapsed.count() << " ms" << std::endl;
     

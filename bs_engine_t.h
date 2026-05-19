@@ -128,7 +128,7 @@ float get_Inertia(const BendStiffner& dimensions, float x) {
 
 float get_EI(const BendStiffner& dimensions, float strain, float x) {
     
-    const float m_E = 1100000;
+    const float m_E = 215800;
     float inertia = get_Inertia(dimensions, x);
     if (strain == 0) {
         return m_E * inertia;
@@ -330,7 +330,7 @@ void calculate_strain(size_t steps,
     {
         //if (i > strain.capacity || i > results.capacity) break;
         float EI = get_EI(bs, strain.items[i], x);
-        strain.items[i] = get_dia(bs, x) * results.items[i].items[2] / EI;
+        strain.items[i] = (get_dia(bs, x) * results.items[i].items[2]) / EI;
         strain.count = count;
         count++;
     }
