@@ -1,1 +1,0 @@
-cl /Zi main.cpp

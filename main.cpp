@@ -5,35 +5,71 @@
 #include <stdio.h>
 #include <SDL3/SDL.h>
 
-
-
 #include <stdio.h>
 #include <chrono>
 #include <iostream>
+#include <string>
 #include "bs_engine_t.h"
 
 #ifdef __EMSCRIPTEN__
 #include "../libs/emscripten/emscripten_mainloop_stub.h"
 #endif
 
+// this is might be the two column parser
+void ParseTwoColumns(Vec1<float> &data1, Vec1<float >&data2, const char* clipboard_data) {
+    if (!clipboard_data || std::strlen(clipboard_data) == 0) return;
+
+    size_t length = std::strlen(clipboard_data);
+    size_t last_pos = 0;
+    
+    int column_index = 0;
+    float first_col_value = 0.0f;
+
+    for (size_t i = 0; i <= length; ++i) {
+        // Evaluate EOF as a line break to process the final cell cleanly
+        char c = (i < length) ? clipboard_data[i] : '\n'; 
+        
+        // separators
+        if (c == '\t' || c == '\n' || c == '\r') {
+            
+            if (c == '\t') {
+                if (column_index == 0) {
+                    // Fast conversion directly from pointer offset (ignores trailing text)
+                    first_col_value = std::strtof(clipboard_data + last_pos, nullptr);
+                    column_index = 1;
+                }
+                last_pos = i + 1;
+                // Skips any columns past the second one on this line
+            } 
+            else { // Linebreaks (\r or \n)
+                if (c == '\r' && (i + 1 < length) && clipboard_data[i + 1] == '\n') {
+                    i++; // Skip Windows style trailing \n pair
+                }
+                
+                if (column_index == 1) {
+                    // Valid 2-column row found
+                    float second_col_value = std::strtof(clipboard_data + last_pos, nullptr);
+                    data1.append(first_col_value);
+                    data2.append(second_col_value);
+                } else if (column_index == 0 && (i > last_pos)) {
+                    // Fallback for a row containing only one numeric value
+                    float fallback_value = std::strtof(clipboard_data + last_pos, nullptr);
+                    data1.append(fallback_value);
+                    data2.append(0.0f); // Default missing column value to 0.0
+                }
+
+                column_index = 0; 
+                last_pos = i + 1;
+            }
+        }
+    }
+}
+
 
 bool solve(float target_angle, BendStiffner &bs, Vec1<Vec1<float>> &results, Vec1<float> &strain)
 {
     auto start = std::chrono::high_resolution_clock::now();
-    // make sure we have a bend stiffner defined
-    //BendStiffner bs;
-    //bs.length = 3.0;
-    //bs.root_dia = 2.0;
-    //bs.tip_dia = 1.0;
-    //bs.inner_dia = 0.5;
-    
-    //float target_angle = 0.2; // 0.2 radians for the target for now
-    
-    // where I am storing the results
-    //Vec1<Vec1<float>> results(DISCRETIZATION);
-    //Vec1<float> strain(DISCRETIZATION);
-    
-    // boundary conditions, always the same for this software
+
     float y0 = 0.0;
     float theta0 = 0.0;
     float ml = 0.0;
@@ -113,7 +149,7 @@ int main ()
     // Create window with SDL_Renderer graphics context
     float main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     SDL_WindowFlags window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    float width = 800;
+    float width = 1280;
     float height = 640;
     SDL_Window* window = SDL_CreateWindow("Bend Stiffner Calculator", (int)(width * main_scale), (int)(height * main_scale), window_flags);
     if (window == nullptr)
@@ -144,7 +180,7 @@ int main ()
     // Setup scaling
     ImGuiStyle& style = ImGui::GetStyle();
     style.ScaleAllSizes(main_scale);              // Bake a fixed style scale. (until we have a solution for dynamic style scaling, changing this requires resetting Style + calling this again)
-    style.FontScaleDpi = main_scale * 1.0;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
+    style.FontScaleDpi = main_scale * 1.25;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
     
     // Setup Platform/Renderer backends
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
@@ -173,7 +209,6 @@ int main ()
     // length array, this is basically for plotting
     float length[DISCRETIZATION];
     
-    
     // Flags about state
     bool solved = false;
     bool extract_results = true;
@@ -181,8 +216,9 @@ int main ()
     bool data_pasted = false;
     bool plot_bs = false;
     
-    //Vec1<float> data1(256);
-    //Vec1<float> data2(256);
+    // the data comming from the excel is assumed to be 256 pairs at the begning
+    Vec1<float> data1(256);
+    Vec1<float> data2(256);
     
     // ###########################################################################################
     
@@ -243,12 +279,13 @@ int main ()
         ImGui::Text("Please insert here the desired BS tip angle");
         ImGui::InputFloat("Target Angle, deg", &target_angle_deg);
         
-        //if (ImGui::Button("Input window", ImVec2 { 0, 0 })) show_input_window = true;
-        //ImGui::SameLine();
+        if (ImGui::Button("Input window", ImVec2 { 0, 0 })) show_input_window = true;
+        ImGui::SameLine();
         
         target_angle = (3.14159265359 / 180.0) * target_angle_deg;
         if (ImGui::Button("Calculate Strain", ImVec2 { 0, 0 }))
         {
+            // TODO: assert that the target angle is higher than zero
             solved = solve(target_angle, bs, results, strain);
             extract_results = true;
             //  this is here because if the lenght changes we need to update the length array
@@ -261,8 +298,8 @@ int main ()
         ImGui::SameLine();
         if (ImGui::Button("Hide/show Bend Stiffner Profile", ImVec2 { 0, 0 })) plot_bs = !plot_bs;
         
-        //ImGui::SameLine();
-        //ImGui::Button("Calculate all input pairs", ImVec2 { 0, 0 })
+        ImGui::SameLine();
+        ImGui::Button("Calculate all input pairs", ImVec2 { 0, 0 });
         
         // display bend stiffner dimensions
         float x_data[5] = { 0, 0, bs.length, bs.length, 0 };
@@ -281,19 +318,6 @@ int main ()
             ImPlot::EndPlot();
         };
         
-        //if (solved && extract_results)
-        //{
-        //    length_counter = 0;
-        //    for (int i = 0; i < DISCRETIZATION; i++)
-        //    {
-        //        fstrain[i] = (float) 100.0 * strain[i];
-        //        //printf("%f\n", fstrain[i]);
-        //        length[i] = length_counter;
-        //        length_counter += bs.length / DISCRETIZATION;
-        //    }
-        //    extract_results = false;
-        //}
-        
         if (solved && extract_results)
         {
             ImPlot::BeginPlot("Bend Stiffner Strain", ImVec2(-1, 0.4 * height*main_scale));
@@ -307,59 +331,67 @@ int main ()
             ImPlot::EndPlot();
         }
         
-        //ImGui::SetNextWindowPos(ImVec2(0, 0));
-        //if (show_input_window)
-        //{
-        //    ImGui::Begin("Input Window", &show_input_window);
-        //    if (ImGui::IsWindowFocused() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
-        //        data1.clear();
-        //        data2.clear();
-        //        const char* clipboardData = ImGui::GetClipboardText();
-        //        if (clipboardData) {
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        if (show_input_window)
+        {
+           ImGui::Begin("Input Window", &show_input_window);
+           if (ImGui::IsWindowFocused() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
+               data1.clear();
+               data2.clear();
+               const char* clipboardData = ImGui::GetClipboardText();
+               if (clipboardData) {
         
-        //            ParseTwoColumns(data1, data2, clipboardData);
-        //        }
-        //        data_pasted = true;
-        //    }
+                   // TODO: need to reimplement the parse2columns function
+                    ParseTwoColumns(data1, data2, clipboardData);
+               }
+               data_pasted = true;
+           }
         
         
-        //    ImGui::Text("Copy and past the angle, tension pairs from excel");
-        //    if (ImGui::BeginTable("InputTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
-        //    {
+           ImGui::Text("Copy and past the angle, tension pairs from excel");
+           if (ImGui::BeginTable("InputTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+           {
         
-        //        // Set up headers
-        //        ImGui::TableSetupColumn("Angle, deg");
-        //        ImGui::TableSetupColumn("Tension, kN");
-        //        ImGui::TableHeadersRow();
+               // Set up headers
+               ImGui::TableSetupColumn("Angle, deg");
+               ImGui::TableSetupColumn("Tension, kN");
+               ImGui::TableHeadersRow();
         
-        //        if (data_pasted)
-        //        {
-        //            for (int i = 0; i < data1.size(); ++i)
-        //            {
-        //                ImGui::PushID(i);
-        //                ImGui::TableNextRow();
-        //                ImGui::TableNextColumn();
-        //                ImGui::InputFloat("##my_hidden_id", &data1[i]);
-        //                ImGui::PopID();
-        //                ImGui::PushID(i + 10000);
-        //                ImGui::TableNextColumn();
-        //                ImGui::InputFloat("##my_hidden_id", &data2[i]);
-        //                ImGui::PopID();
-        //            }
-        //        }
+               if (data_pasted)
+               {
+                   size_t lowest_count;
+                   if (data1.count < data2.count)
+                   {
+                       lowest_count = data1.count;
+                   } else
+                   {
+                       lowest_count = data2.count;
+                   }
+                   for (int i = 0; i < lowest_count; ++i)
+                   {
+                       ImGui::PushID(i);
+                       ImGui::TableNextRow();
+                       ImGui::TableNextColumn();
+                       ImGui::InputFloat("##my_hidden_id", &data1.items[i]);
+                       ImGui::PopID();
+                       ImGui::PushID(i + 10000);
+                       ImGui::TableNextColumn();
+                       ImGui::InputFloat("##my_hidden_id", &data2.items[i]);
+                       ImGui::PopID();
+                   }
+               }
         
-        //        ImGui::EndTable();
-        //    }
-        //    if (ImGui::Button("Close Me"))
-        //        show_input_window = false;
-        //    ImGui::End();
-        //};
+               ImGui::EndTable();
+           }
+           if (ImGui::Button("Close Me"))
+               show_input_window = false;
+           ImGui::End();
+        };
         
-        //if (data1.size() > 0)
-        //{
-        //    auto it = std::max_element(data1.begin(), data1.end());
-        //    target_angle_deg = *it;
-        //}
+        if (data1.count > 0)
+        {
+            target_angle_deg = data1.max_pos();
+        }
         
         // ##########################################################################
         ImGui::End();

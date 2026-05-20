@@ -47,6 +47,30 @@ struct Vec1 {
         items[count] = item;
         count++;
     };
+    
+    void clear() 
+    {
+        memset(items, 0, capacity*sizeof(float));
+        count = 0;
+    };
+    
+    // returns the largest positive value or zero if all elements are negative
+    float max_pos()
+    {
+        float max_element = 0.0;
+        // need to make sure that the count is higher than zero
+        if (count == 0.0)
+        {
+            return 0.0;
+        } else
+        {
+            for (int i = 0.0; i < count; i++)
+            {
+                if (items[i] > max_element) max_element = items[i];
+            };
+            return max_element;
+        };
+    };
 };
 
 
