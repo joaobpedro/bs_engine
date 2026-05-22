@@ -1,0 +1,7 @@
+-xc++
+-std=c++17
+-I.\imgui
+-I.\imgui\backends
+-IC:\source\personal\SDL3-3.4.8\include
+-fms-compatibility
+-fms-extensions

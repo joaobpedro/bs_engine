@@ -135,6 +135,26 @@ bool solve(float target_angle, BendStiffner &bs, Vec1<Vec1<float>> &results, Vec
     return true;
 }
 
+void solve_pairs(Vec1<float> &strain_maxs, Vec1<float> &data1, BendStiffner &bs, Vec1<Vec1<float>> &results, Vec1<float> &strain) 
+{
+    for (int i = 0; i < data1.count; i++)
+    {
+        // data1 comes in degress need to convert to rads
+        // just call the solving function at each pair
+        float angle_deg = data1.items[i] * (3.14159265359 / 180.0); 
+        solve(angle_deg, bs, results, strain);
+        strain_maxs.append(strain.max_pos());
+        
+    };
+
+    // printf("The maxstrain per pair is:\n");
+    // for (int i = 0; i < strain_maxs.count; ++i) 
+    // {
+    //     printf("%f\n", strain_maxs.items[i]);
+    // }
+
+};
+
 
 
 int main ()
@@ -197,7 +217,7 @@ int main ()
     
     
     // variable to store results, both initalized to zeros
-    // TODOS: need to guarantee the zero initialization
+    // TODO: need to guarantee the zero initialization
     Vec1<Vec1<float>> results(DISCRETIZATION);
     Vec1<float> strain(DISCRETIZATION);
     // this is hugly code but for now is good enough
@@ -205,6 +225,9 @@ int main ()
     {
         strain.append(0);
     }
+
+    // 256 items is the standard size for this array
+    Vec1<float> strain_maxs(256);
     
     // length array, this is basically for plotting
     float length[DISCRETIZATION];
@@ -215,6 +238,7 @@ int main ()
     bool show_input_window = false;
     bool data_pasted = false;
     bool plot_bs = false;
+    bool plot_pairs = false;
     
     // the data comming from the excel is assumed to be 256 pairs at the begning
     Vec1<float> data1(256);
@@ -299,8 +323,14 @@ int main ()
         if (ImGui::Button("Hide/show Bend Stiffner Profile", ImVec2 { 0, 0 })) plot_bs = !plot_bs;
         
         ImGui::SameLine();
-        ImGui::Button("Calculate all input pairs", ImVec2 { 0, 0 });
-        
+        if (ImGui::Button("Calculate all input pairs", ImVec2 { 0, 0 })) 
+        {
+            solve_pairs(strain_maxs, data1, bs, results, strain);
+        }        
+
+        ImGui::SameLine();
+        if (ImGui::Button("Show strain for tension/angle pairs", ImVec2{0,0})) plot_pairs = !plot_pairs;
+
         // display bend stiffner dimensions
         float x_data[5] = { 0, 0, bs.length, bs.length, 0 };
         float y_data[5] = { -bs.root_dia / 2, bs.root_dia / 2, bs.tip_dia / 2, -bs.tip_dia / 2 , -bs.root_dia / 2 };
@@ -391,6 +421,21 @@ int main ()
         if (data1.count > 0)
         {
             target_angle_deg = data1.max_pos();
+        }
+
+
+        // this is the plot of the strain for the tension strain pairs
+        if (plot_pairs)
+        {
+            ImPlot::BeginPlot("Bend Stiffner Strain Values for Tension Angle Pairs", ImVec2(-1, 0.4 * height*main_scale));
+            ImPlot::SetupAxes("Angles", "Strain, -");
+            //ImPlot::SetupAxesLimits(-0.1*bs.length, bs.length * 1.1);
+            // need more configuration then this, some axis scale and some
+            ImPlotSpec spec2;
+            spec2.LineWeight = 5.f;
+            spec2.Flags = ImPlotItemFlags_NoLegend;
+            ImPlot::PlotScatter("Bend Stiffner Plot", data1.items, strain_maxs.items, data1.count, spec2);
+            ImPlot::EndPlot();
         }
         
         // ##########################################################################
