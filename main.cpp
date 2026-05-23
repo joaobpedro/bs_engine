@@ -325,6 +325,8 @@ int main ()
         ImGui::SameLine();
         if (ImGui::Button("Calculate all input pairs", ImVec2 { 0, 0 })) 
         {
+            // TODO: clear all pairs maybes before calling the solve pairs again
+            strain_maxs.clear();
             solve_pairs(strain_maxs, data1, bs, results, strain);
         }        
 
@@ -417,6 +419,15 @@ int main ()
                show_input_window = false;
            ImGui::End();
         };
+       
+        // if(ImGui::Button("Plot data 1", ImVec2{0,0}))
+        // {
+        //     printf("Data1 ietms:\n");
+        //     for (int i =0; i<data1.count; i++)
+        //     {
+        //         printf("%f\n", data1.items[i]);
+        //     }
+        // }
         
         if (data1.count > 0)
         {
@@ -434,7 +445,7 @@ int main ()
             ImPlotSpec spec2;
             spec2.LineWeight = 5.f;
             spec2.Flags = ImPlotItemFlags_NoLegend;
-            ImPlot::PlotScatter("Bend Stiffner Plot", data1.items, strain_maxs.items, data1.count, spec2);
+            ImPlot::PlotScatter("Strain Max Values for all pairs", data1.items, strain_maxs.items, data1.count, spec2);
             ImPlot::EndPlot();
         }
         
