@@ -1,5 +1,6 @@
 -xc++
 -std=c++17
+-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
 -I.\imgui
 -I.\imgui\backends
 -IC:\source\personal\SDL3-3.4.8\include

@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <chrono>
 #include <iostream>
-#include <string>
 #include "bs_engine_t.h"
 
 #ifdef __EMSCRIPTEN__
