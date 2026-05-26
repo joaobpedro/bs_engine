@@ -1,0 +1,2 @@
+- [ ] make sure the input can take the material properties
+- [ ] organize the ui to be more friendly and make sure its clear what is what
