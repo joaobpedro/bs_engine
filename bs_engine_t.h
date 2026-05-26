@@ -88,16 +88,17 @@ float get_non_linear_E(float strain) { // need to pass material object in this c
     int min_index = 0;
     int max_index = 0;
 
-    if (strain <= strain_vector[0]) return strain_vector[0];
-    if (strain >= strain_vector[material_data_size-1]) return strain_vector[material_data_size-1];
+    if (strain <= strain_vector[0]) return Emod_vector[0] * 1000;
+    if (strain >= strain_vector[material_data_size-1]) return Emod_vector[material_data_size-1] * 1000;
     
     // need to use the absolute values here
-    for (int i = 0; i < sizeof(strain_vector); i++)
+    for (size_t  i = 0; i < material_data_size; i++)
     {
         prev_distance = distance;
         distance = strain_vector[i] - strain;
         if (std::fabs(distance) < std::fabs(prev_distance))
         {
+            if (distance == 0.0) return Emod_vector[i] * 1000;
             if (distance < 0)
             {
                 min_index = i;
@@ -113,13 +114,13 @@ float get_non_linear_E(float strain) { // need to pass material object in this c
     
     // need to deal with the edge cases
     if (min_index < 0) {
-        min_index = 1;
+        min_index = 0;
         max_index = min_index + 1;
     };
     
-    if (max_index > sizeof(strain_vector))
+    if (max_index > sizeof(strain_vector)-1)
     {
-        max_index = sizeof(strain_vector);
+        max_index = sizeof(strain_vector)-1;
         min_index = max_index - 1;
     }
     
@@ -127,7 +128,7 @@ float get_non_linear_E(float strain) { // need to pass material object in this c
     float x1 = strain_vector[max_index];
     float y0 = Emod_vector[min_index];
     float y1 = Emod_vector[max_index];
-    float result = y1 + (strain - x0) * (y0 - y1) / (x1 - x0);
+    float result = y1 + (strain - x0) * (y1 - y0) / (x1 - x0);
     return result * 1000.0; // convert to MPa
 };
 
