@@ -1,3 +1,4 @@
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 @set OUT_DIR=Debug
 @set OUT_EXE=bs_engine
 @set SDL3_DIR=C:\source\personal\SDL3-3.4.8

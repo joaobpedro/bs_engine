@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cassert>
 
 #define DISCRETIZATION 50
 #define NUMBER_OF_STATES 4
@@ -83,15 +84,19 @@ float get_non_linear_E(float strain) { // need to pass material object in this c
     float Emod_vector[material_data_size] = { 215800, 215800, 179500, 138100, 94300, 59500, 39700, 28200, 21100, 17000, 14300, 12700, 11000, 10600, 10000, 9700, 9600, 8600, 9400, 8600, 8500 };
     
     float distance = 1000;
+    float prev_distance = 10;
     int min_index = 0;
     int max_index = 0;
+
+    if (strain <= strain_vector[0]) return strain_vector[0];
+    if (strain >= strain_vector[material_data_size-1]) return strain_vector[material_data_size-1];
     
     // need to use the absolute values here
-    for (int i = 0; i < sizeof(strain); i++)
+    for (int i = 0; i < sizeof(strain_vector); i++)
     {
-        float prev_distance = distance;
+        prev_distance = distance;
         distance = strain_vector[i] - strain;
-        if (std::fabs(distance < prev_distance))
+        if (std::fabs(distance) < std::fabs(prev_distance))
         {
             if (distance < 0)
             {
@@ -126,6 +131,52 @@ float get_non_linear_E(float strain) { // need to pass material object in this c
     return result * 1000.0; // convert to MPa
 };
 
+float get_non_linear_E_custom(float strain, Vec1<float> &strain_input_vector, Vec1<float> &E_mod_input_vector) { // need to pass material object in this call
+    float distance = 1000;
+    int min_index = 0;
+    int max_index = 0;
+    
+    assert(strain_input_vector.count == E_mod_input_vector.count);
+
+    // need to use the absolute values here
+    for (int i = 0; i < strain_input_vector.count; i++)
+    {
+        float prev_distance = distance;
+        distance = strain_input_vector.items[i] - strain;
+        if (std::fabs(distance < prev_distance))
+        {
+            if (distance < 0)
+            {
+                min_index = i;
+                max_index = i + 1;
+            };
+            if (distance > 0)
+            {
+                min_index = i - 1;
+                max_index = i;
+            }
+        };
+    }
+    
+    // need to deal with the edge cases
+    if (min_index < 0) {
+        min_index = 1;
+        max_index = min_index + 1;
+    };
+    
+    if (max_index > sizeof(strain_input_vector.count))
+    {
+        max_index = strain_input_vector.count;
+        min_index = max_index - 1;
+    }
+    
+    float x0 = strain_input_vector.items[min_index];
+    float x1 = strain_input_vector.items[max_index];
+    float y0 = E_mod_input_vector.items[min_index];
+    float y1 = E_mod_input_vector.items[max_index];
+    float result = y1 + (strain - x0) * (y0 - y1) / (x1 - x0);
+    return result * 1000.0; // convert to MPa
+};
 
 float get_dia(const BendStiffner &dimensions, float x) {
     
