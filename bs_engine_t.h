@@ -84,15 +84,19 @@ float get_non_linear_E(float strain) { // need to pass material object in this c
     float Emod_vector[material_data_size] = { 215800, 215800, 179500, 138100, 94300, 59500, 39700, 28200, 21100, 17000, 14300, 12700, 11000, 10600, 10000, 9700, 9600, 8600, 9400, 8600, 8500 };
     
     float distance = 1000;
+    float prev_distance = 10;
     int min_index = 0;
     int max_index = 0;
+
+    if (strain <= strain_vector[0]) return strain_vector[0];
+    if (strain >= strain_vector[material_data_size-1]) return strain_vector[material_data_size-1];
     
     // need to use the absolute values here
     for (int i = 0; i < sizeof(strain_vector); i++)
     {
-        float prev_distance = distance;
+        prev_distance = distance;
         distance = strain_vector[i] - strain;
-        if (std::fabs(distance < prev_distance))
+        if (std::fabs(distance) < std::fabs(prev_distance))
         {
             if (distance < 0)
             {
@@ -135,7 +139,7 @@ float get_non_linear_E_custom(float strain, Vec1<float> &strain_input_vector, Ve
     assert(strain_input_vector.count == E_mod_input_vector.count);
 
     // need to use the absolute values here
-    for (int i = 0; i < sizeof(strain_input_vector.count); i++)
+    for (int i = 0; i < strain_input_vector.count; i++)
     {
         float prev_distance = distance;
         distance = strain_input_vector.items[i] - strain;
