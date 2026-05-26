@@ -433,7 +433,7 @@ int main ()
             ImPlotSpec spec2;
             spec2.LineWeight = 5.f;
             spec2.Flags = ImPlotItemFlags_NoLegend;
-            ImPlot::PlotScatter("Bend Stiffner Plot", data1.items, strain_maxs.items, data1.count, spec2);
+            ImPlot::PlotScatter("Strain Max Values for each Tension Angle Pair", data1.items, strain_maxs.items, data1.count, spec2);
             ImPlot::EndPlot();
         }
         
