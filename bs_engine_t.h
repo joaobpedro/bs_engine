@@ -51,7 +51,7 @@ struct Vec1 {
     
     void clear() 
     {
-        memset(items, 0, capacity*sizeof(float));
+        memset(items, 0, capacity*sizeof(T));
         count = 0;
     };
     
