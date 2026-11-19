@@ -10,7 +10,7 @@
 		<IsFolder>false</IsFolder>
 		<UseVisualStudioEnvBat>true</UseVisualStudioEnvBat>
 		<CaptureExeOutput>false</CaptureExeOutput>
-		<AllowAutoErrorUnderlining>true</AllowAutoErrorUnderlining>
+		<AllowAutoErrorUnderlining_v3>true</AllowAutoErrorUnderlining_v3>
 		<Configurations>
 			<Configuration>Debug</Configuration>
 			<Configuration>Release</Configuration>
@@ -31,6 +31,8 @@
 			<AdditionalIncludePath>C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\include\um</AdditionalIncludePath>
 			<AdditionalIncludePath>C:\Users\joao\source\SDL3-3.4.2\include\</AdditionalIncludePath>
 			<AdditionalIncludePath>C:\Users\joao\source\bs_engine_t\imgui\</AdditionalIncludePath>
+			<AdditionalIncludePath>C:\source\personal\SDL3-3.4.8\include</AdditionalIncludePath>
+			<AdditionalIncludePath>C:\source\personal\SDL3_image-3.4.4\include</AdditionalIncludePath>
 		</AdditionalIncludePaths>
 		<Defines></Defines>
 		<ConfigProperties>
@@ -84,8 +86,8 @@
 				<Name>x64</Name>
 				<Defines></Defines>
 			</Platform>
-			<TerminalDirectory></TerminalDirectory>
 		</ConfigProperties>
+		<TerminalDirectory></TerminalDirectory>
 		<Children></Children>
 	</Workspace>
 </N10X>

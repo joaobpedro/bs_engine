@@ -1,10 +1,10 @@
 @REM Build for Visual Studio compiler. Run your copy of vcvars32.bat or vcvarsall.bat to setup command-line compiler.
 @set OUT_DIR=Release
 @set OUT_EXE=bend_stiffner_calculator
-@set SDL3_DIR=C:\Users\joao\source\SDL3-3.4.2
+@set SDL3_DIR=C:\source\personal\SDL3-3.4.8
 @set INCLUDES=/I.\imgui /I.\imgui\backends /I%SDL3_DIR%\include
 @set SOURCES=main.cpp .\imgui\backends\imgui_impl_sdl3.cpp .\imgui\backends\imgui_impl_sdlrenderer3.cpp .\imgui\imgui*.cpp .\imgui\implot*.cpp
-@set LIBS=C:\Users\joao\source\SDL3-3.4.2\lib\x64\SDL3.lib
+@set LIBS=%SDL3_DIR%\lib\x64\SDL3.lib User32.lib
 mkdir %OUT_DIR%
 @REM cl /nologo /Zi /MD /utf-8 %INCLUDES% %SOURCES% /Fe%OUT_DIR%/%OUT_EXE%.exe /Fo%OUT_DIR%/ /link %LIBS% /subsystem:console
-cl /O2 /GL /DNDEBUG /MD /Gy /Zi /EHscD /utf-8 %INCLUDES% %SOURCES% /Fe%OUT_DIR%/%OUT_EXE%.exe /Fo%OUT_DIR%/ /link /OPT:REF /OPT:ICF /LTCG  %LIBS% /subsystem:console
+cl /O2 /GL /DNDEBUG /MD /Gy /Zi /EHsc /utf-8 /std:c++17 %INCLUDES% %SOURCES% /Fe%OUT_DIR%/%OUT_EXE%.exe /Fo%OUT_DIR%/ /link /OPT:REF /OPT:ICF /LTCG  %LIBS% /subsystem:console
