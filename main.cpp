@@ -20,6 +20,7 @@
 #include <string>
 #include <cstring>
 #include "bs_engine_t.h"
+#include "bs_icon.h"
 
 #ifdef __EMSCRIPTEN__
 #include "../libs/emscripten/emscripten_mainloop_stub.h"
@@ -206,6 +207,13 @@ int main()
         return 1;
     }
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    if (SDL_Surface* icon_surface = SDL_CreateSurfaceFrom(
+            BS_ICON_WIDTH, BS_ICON_HEIGHT, SDL_PIXELFORMAT_RGBA32,
+            (void*)BS_ICON_RGBA, BS_ICON_WIDTH * 4))
+    {
+        SDL_SetWindowIcon(window, icon_surface);
+        SDL_DestroySurface(icon_surface);
+    }
     SDL_ShowWindow(window);
 
     float window_scale = SDL_GetWindowDisplayScale(window);

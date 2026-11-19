@@ -6,5 +6,6 @@
 @set SOURCES=main.cpp .\imgui\backends\imgui_impl_sdl3.cpp .\imgui\backends\imgui_impl_sdlrenderer3.cpp .\imgui\imgui*.cpp .\imgui\implot*.cpp
 @set LIBS=%SDL3_DIR%\lib\x64\SDL3.lib User32.lib
 mkdir %OUT_DIR%
+rc /nologo /fo %OUT_DIR%\bs_engine.res bs_engine.rc
 @REM cl /nologo /Zi /MD /utf-8 %INCLUDES% %SOURCES% /Fe%OUT_DIR%/%OUT_EXE%.exe /Fo%OUT_DIR%/ /link %LIBS% /subsystem:console
-cl /O2 /GL /DNDEBUG /MD /Gy /Zi /EHsc /utf-8 /std:c++17 %INCLUDES% %SOURCES% /Fe%OUT_DIR%/%OUT_EXE%.exe /Fo%OUT_DIR%/ /link /OPT:REF /OPT:ICF /LTCG  %LIBS% /subsystem:console
+cl /O2 /GL /DNDEBUG /MD /Gy /Zi /EHsc /utf-8 /std:c++17 %INCLUDES% %SOURCES% /Fe%OUT_DIR%/%OUT_EXE%.exe /Fo%OUT_DIR%/ /link /OPT:REF /OPT:ICF /LTCG  %LIBS% %OUT_DIR%\bs_engine.res /subsystem:console
