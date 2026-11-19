@@ -197,38 +197,112 @@ static constexpr float DEFAULT_EMOD_VECTOR_KPA[DEFAULT_MATERIAL_DATA_SIZE] = {
     10000.0f,  9700.0f,   9600.0f,   8600.0f,   9400.0f,  8600.0f,  8500.0f
 };
 
+enum MaterialTempMode {
+    MAT_TEMP_NOMINAL = 0,
+    MAT_TEMP_COLD    = 1,
+    MAT_TEMP_HOT     = 2
+};
+
 struct Material {
     bool is_nonlinear;
     bool table_is_tangent_modulus;       // true: table is d(sigma)/d(eps), integrate for stress & secant E
     bool use_cross_section_integration;  // true: integrate stress across annular depth y in [0, R_o]
-    float linear_E_kpa;
+    int active_temp_mode;                // MAT_TEMP_NOMINAL, MAT_TEMP_COLD, or MAT_TEMP_HOT
+
+    float temp_nominal_c;
+    float temp_cold_c;
+    float temp_hot_c;
+
+    float linear_E_nominal_kpa;
+    float linear_E_cold_kpa;
+    float linear_E_hot_kpa;
+    float linear_E_kpa; // Active linear E [kPa]
+
     Vec1<float> strain_table;
-    Vec1<float> emod_table_kpa;
+    Vec1<float> emod_nominal_kpa;
+    Vec1<float> emod_cold_kpa;
+    Vec1<float> emod_hot_kpa;
+    Vec1<float> emod_table_kpa; // Active table E [kPa]
 
     Material()
         : is_nonlinear(true),
           table_is_tangent_modulus(true),
           use_cross_section_integration(false),
+          active_temp_mode(MAT_TEMP_NOMINAL),
+          temp_nominal_c(20.0f),
+          temp_cold_c(4.0f),
+          temp_hot_c(35.0f),
+          linear_E_nominal_kpa(215800.0f),
+          linear_E_cold_kpa(215800.0f * 1.35f),
+          linear_E_hot_kpa(215800.0f * 0.75f),
           linear_E_kpa(215800.0f),
           strain_table(DEFAULT_MATERIAL_DATA_SIZE),
+          emod_nominal_kpa(DEFAULT_MATERIAL_DATA_SIZE),
+          emod_cold_kpa(DEFAULT_MATERIAL_DATA_SIZE),
+          emod_hot_kpa(DEFAULT_MATERIAL_DATA_SIZE),
           emod_table_kpa(DEFAULT_MATERIAL_DATA_SIZE) {
         reset_to_default();
     }
 
-    void reset_to_default(float scale_factor = 1.0f) {
+    void sync_active_table() {
+        if (active_temp_mode == MAT_TEMP_COLD) {
+            emod_table_kpa = emod_cold_kpa;
+            linear_E_kpa = linear_E_cold_kpa;
+        } else if (active_temp_mode == MAT_TEMP_HOT) {
+            emod_table_kpa = emod_hot_kpa;
+            linear_E_kpa = linear_E_hot_kpa;
+        } else {
+            emod_table_kpa = emod_nominal_kpa;
+            linear_E_kpa = linear_E_nominal_kpa;
+        }
+    }
+
+    void set_active_temp_mode(int mode) {
+        active_temp_mode = std::clamp(mode, 0, 2);
+        sync_active_table();
+    }
+
+    Material with_temp_mode(int mode) const {
+        Material m = *this;
+        m.set_active_temp_mode(mode);
+        return m;
+    }
+
+    void reset_to_default(float nominal_scale = 1.0f, float cold_scale = 1.35f, float hot_scale = 0.75f) {
         strain_table.clear();
-        emod_table_kpa.clear();
+        emod_nominal_kpa.clear();
+        emod_cold_kpa.clear();
+        emod_hot_kpa.clear();
         for (int i = 0; i < DEFAULT_MATERIAL_DATA_SIZE; ++i) {
             strain_table.append(DEFAULT_STRAIN_VECTOR[i]);
-            emod_table_kpa.append(DEFAULT_EMOD_VECTOR_KPA[i] * scale_factor);
+            emod_nominal_kpa.append(DEFAULT_EMOD_VECTOR_KPA[i] * nominal_scale);
+            emod_cold_kpa.append(DEFAULT_EMOD_VECTOR_KPA[i] * cold_scale);
+            emod_hot_kpa.append(DEFAULT_EMOD_VECTOR_KPA[i] * hot_scale);
         }
-        linear_E_kpa = DEFAULT_EMOD_VECTOR_KPA[0] * scale_factor;
+        linear_E_nominal_kpa = DEFAULT_EMOD_VECTOR_KPA[0] * nominal_scale;
+        linear_E_cold_kpa = DEFAULT_EMOD_VECTOR_KPA[0] * cold_scale;
+        linear_E_hot_kpa = DEFAULT_EMOD_VECTOR_KPA[0] * hot_scale;
+        sync_active_table();
+    }
+
+    const Vec1<float>& get_active_emod_table() const {
+        if (active_temp_mode == MAT_TEMP_COLD && emod_cold_kpa.count == strain_table.count) return emod_cold_kpa;
+        if (active_temp_mode == MAT_TEMP_HOT && emod_hot_kpa.count == strain_table.count) return emod_hot_kpa;
+        if (emod_nominal_kpa.count == strain_table.count) return emod_nominal_kpa;
+        return emod_table_kpa;
+    }
+
+    float get_active_linear_E_kpa() const {
+        if (active_temp_mode == MAT_TEMP_COLD) return linear_E_cold_kpa;
+        if (active_temp_mode == MAT_TEMP_HOT) return linear_E_hot_kpa;
+        return linear_E_nominal_kpa;
     }
 
     bool has_valid_table() const {
+        const Vec1<float>& active_t = get_active_emod_table();
         return strain_table.count >= 2 &&
-               strain_table.count == emod_table_kpa.count &&
-               emod_table_kpa.items[0] > 0.0f;
+               strain_table.count == active_t.count &&
+               active_t.items[0] > 0.0f;
     }
 };
 
@@ -288,16 +362,17 @@ inline float get_non_linear_E_custom(float strain, const Vec1<float> &strain_inp
 // Evaluates point-wise fiber Secant Young's Modulus E_sec(strain) in Pa
 inline float get_fiber_E_secant(float strain, const Material &mat) {
     if (!mat.is_nonlinear || !mat.has_valid_table()) {
-        return std::max(1.0f, mat.linear_E_kpa) * 1000.0f;
+        return std::max(1.0f, mat.get_active_linear_E_kpa()) * 1000.0f;
     }
 
     float s = std::fabs(strain);
+    const Vec1<float>& active_emod = mat.get_active_emod_table();
     size_t n = mat.strain_table.count;
     const float* xs = mat.strain_table.items;
-    const float* ys = mat.emod_table_kpa.items;
+    const float* ys = active_emod.items;
 
     if (!mat.table_is_tangent_modulus) {
-        return get_non_linear_E_custom(s, mat.strain_table, mat.emod_table_kpa);
+        return get_non_linear_E_custom(s, mat.strain_table, active_emod);
     }
 
     if (s <= 1e-7f || s <= xs[0]) {
@@ -358,13 +433,14 @@ inline float solve_strain_from_stress(double sigma_req_pa, const Material &mat) 
     if (sigma_req_pa <= 0.0) return 0.0f;
 
     if (!mat.is_nonlinear || !mat.has_valid_table()) {
-        double E_pa = std::max(1.0, (double)mat.linear_E_kpa) * 1000.0;
+        double E_pa = std::max(1.0, (double)mat.get_active_linear_E_kpa()) * 1000.0;
         return (float)(sigma_req_pa / E_pa);
     }
 
+    const Vec1<float>& active_emod = mat.get_active_emod_table();
     size_t n = mat.strain_table.count;
     const float* xs = mat.strain_table.items;
-    const float* ys = mat.emod_table_kpa.items;
+    const float* ys = active_emod.items;
     double sigma_kpa = sigma_req_pa / 1000.0;
 
     float eps_est = 0.0f;
@@ -931,7 +1007,17 @@ struct OptimizationConfig {
     bool optimize_root_dia = true;
     bool use_all_pairs = false;
     bool force_far_field_when_tension = true;
+    bool include_temp_envelope = false;    // Check Cold (1.35x), Nominal (1.0x), and Warm (0.75x) during optimization
 };
+
+inline Material scale_material(const Material &base_mat, float factor) {
+    Material m = base_mat;
+    m.linear_E_kpa = base_mat.linear_E_kpa * factor;
+    for (size_t i = 0; i < m.emod_table_kpa.count; ++i) {
+        m.emod_table_kpa.items[i] = base_mat.emod_table_kpa.items[i] * factor;
+    }
+    return m;
+}
 
 struct OptimizationResult {
     bool converged = false;
@@ -1085,20 +1171,26 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
         float worst_m0 = 0.0f;
         float avg_eps_accum = 0.0f;
 
-        for (int c = 0; c < num_cases; ++c) {
-            BendStiffner case_bs = cand;
-            if (cfg.force_far_field_when_tension && std::fabs(cases[c].tension_N) > 10.0f) {
-                case_bs.use_far_field_bc = true;
+        int temp_modes[3] = { MAT_TEMP_NOMINAL, MAT_TEMP_COLD, MAT_TEMP_HOT };
+        int n_temps = cfg.include_temp_envelope ? 3 : 1;
+
+        for (int t_idx = 0; t_idx < n_temps; ++t_idx) {
+            Material case_mat = (t_idx == 0 && !cfg.include_temp_envelope) ? mat : mat.with_temp_mode(temp_modes[t_idx]);
+            for (int c = 0; c < num_cases; ++c) {
+                BendStiffner case_bs = cand;
+                if (cfg.force_far_field_when_tension && std::fabs(cases[c].tension_N) > 10.0f) {
+                    case_bs.use_far_field_bc = true;
+                }
+                float c_max_eps = 0.0f, c_avg_eps = 0.0f, c_tip_eps = 0.0f, c_root_eps = 0.0f, c_mbr = 1000.0f, c_m0 = 0.0f;
+                evaluate_candidate_single(case_bs, case_mat, steps, cases[c].angle_rad, cases[c].tension_N,
+                                          c_max_eps, c_avg_eps, c_tip_eps, c_root_eps, c_mbr, c_m0);
+                if (c_max_eps > worst_eps) worst_eps = c_max_eps;
+                if (c_mbr < worst_mbr) worst_mbr = c_mbr;
+                if (c_m0 > worst_m0) worst_m0 = c_m0;
+                avg_eps_accum += c_avg_eps;
             }
-            float c_max_eps = 0.0f, c_avg_eps = 0.0f, c_tip_eps = 0.0f, c_root_eps = 0.0f, c_mbr = 1000.0f, c_m0 = 0.0f;
-            evaluate_candidate_single(case_bs, mat, steps, cases[c].angle_rad, cases[c].tension_N,
-                                      c_max_eps, c_avg_eps, c_tip_eps, c_root_eps, c_mbr, c_m0);
-            if (c_max_eps > worst_eps) worst_eps = c_max_eps;
-            if (c_mbr < worst_mbr) worst_mbr = c_mbr;
-            if (c_m0 > worst_m0) worst_m0 = c_m0;
-            avg_eps_accum += c_avg_eps;
         }
-        avg_eps_accum /= (float)num_cases;
+        avg_eps_accum /= (float)(num_cases * n_temps);
 
         out_max_eps = worst_eps;
         out_min_mbr = worst_mbr;
@@ -1208,4 +1300,315 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
     res.mbr_utilization = (res.min_mbr_m > 1e-5f) ? (initial_bs.allowable_mbr_m / res.min_mbr_m) : 0.0f;
     return res;
 }
+
+#define TAIL_NODES 25
+
+// Integrates the bare flexible pipe tail beyond the bend stiffener tip (s in [L, L + tail_length])
+inline void simulate_bare_pipe_tail(const BendStiffner &bs,
+                                    float tip_x,
+                                    float tip_y,
+                                    float tip_theta,
+                                    float tip_moment_Nm,
+                                    float tension_N,
+                                    float target_angle_rad,
+                                    float tail_length,
+                                    float out_s[TAIL_NODES],
+                                    float out_x[TAIL_NODES],
+                                    float out_y[TAIL_NODES],
+                                    float out_theta[TAIL_NODES],
+                                    float out_moment_kNm[TAIL_NODES],
+                                    float out_curvature[TAIL_NODES],
+                                    float out_mbr[TAIL_NODES]) {
+    float pipe_EI_Pa = std::max(1.0f, bs.pipe_EI_kNm2 * 1000.0f);
+    float T_abs = std::fabs(tension_N);
+    bool far_field = bs.use_far_field_bc && (T_abs > 1e-2f);
+    float h = tail_length / (float)(TAIL_NODES - 1);
+
+    float s = bs.length;
+    float x = tip_x;
+    float y = tip_y;
+    float theta = tip_theta;
+    float m = far_field ? tip_moment_Nm : 0.0f;
+
+    auto deriv = [&](float th, float mom, float &dx, float &dy, float &dth, float &dm) {
+        dx = std::cos(th);
+        dy = std::sin(th);
+        dth = far_field ? (mom / pipe_EI_Pa) : 0.0f;
+        dm = far_field ? (-T_abs * std::sin(target_angle_rad - th)) : 0.0f;
+    };
+
+    for (int i = 0; i < TAIL_NODES; ++i) {
+        out_s[i] = s;
+        out_x[i] = x;
+        out_y[i] = y;
+        out_theta[i] = theta;
+        out_moment_kNm[i] = m / 1000.0f;
+        float k_abs = far_field ? (std::fabs(m) / pipe_EI_Pa) : 0.0f;
+        out_curvature[i] = k_abs;
+        out_mbr[i] = (k_abs > 1e-6f) ? std::min(1000.0f, 1.0f / k_abs) : 1000.0f;
+
+        if (i + 1 < TAIL_NODES) {
+            float k1x, k1y, k1th, k1m;
+            deriv(theta, m, k1x, k1y, k1th, k1m);
+            float k2x, k2y, k2th, k2m;
+            deriv(theta + 0.5f * h * k1th, m + 0.5f * h * k1m, k2x, k2y, k2th, k2m);
+            float k3x, k3y, k3th, k3m;
+            deriv(theta + 0.5f * h * k2th, m + 0.5f * h * k2m, k3x, k3y, k3th, k3m);
+            float k4x, k4y, k4th, k4m;
+            deriv(theta + h * k3th, m + h * k3m, k4x, k4y, k4th, k4m);
+
+            x += (h / 6.0f) * (k1x + 2.0f * k2x + 2.0f * k3x + k4x);
+            y += (h / 6.0f) * (k1y + 2.0f * k2y + 2.0f * k3y + k4y);
+            theta += (h / 6.0f) * (k1th + 2.0f * k2th + 2.0f * k3th + k4th);
+            m += (h / 6.0f) * (k1m + 2.0f * k2m + 2.0f * k3m + k4m);
+            s += h;
+        }
+    }
+}
+
+struct TemperatureCheckRow {
+    const char* label;
+    float temp_c;
+    float initial_E_mpa;
+    float max_strain;
+    float min_mbr_m;
+    float root_moment_kNm;
+    float root_shear_kN;
+    float root_axial_kN;
+    bool pass;
+};
+
+struct TemperatureEnvelopeSummary {
+    bool evaluated = false;
+    bool all_pass = false;
+    TemperatureCheckRow rows[3]; // 0: Cold, 1: Nominal, 2: Hot
+    float governing_strain = 0.0f;
+    float governing_min_mbr_m = 1000.0f;
+    float governing_root_moment_kNm = 0.0f;
+    float governing_root_shear_kN = 0.0f;
+    float governing_root_axial_kN = 0.0f;
+};
+
+inline TemperatureEnvelopeSummary evaluate_temperature_envelope(const BendStiffner &bs,
+                                                                const Material &base_mat,
+                                                                float angle_deg,
+                                                                float tension_kN) {
+    TemperatureEnvelopeSummary env;
+    if (!is_valid_geometry(bs)) return env;
+
+    static const char* labels[3] = {
+        "Cold Temperature Curve",
+        "Nominal Temperature Curve",
+        "Hot / Warm Temperature Curve"
+    };
+    static const int modes[3] = { MAT_TEMP_COLD, MAT_TEMP_NOMINAL, MAT_TEMP_HOT };
+    const float temps_c[3] = { base_mat.temp_cold_c, base_mat.temp_nominal_c, base_mat.temp_hot_c };
+
+    float angle_rad = angle_deg * (3.14159265358979323846f / 180.0f);
+    float tension_N = tension_kN * 1000.0f;
+    const size_t steps = (DISCRETIZATION > 1) ? (DISCRETIZATION - 1) : 24;
+
+    env.evaluated = true;
+    env.all_pass = true;
+    env.governing_strain = 0.0f;
+    env.governing_min_mbr_m = 1000.0f;
+    env.governing_root_moment_kNm = 0.0f;
+    env.governing_root_shear_kN = 0.0f;
+    env.governing_root_axial_kN = 0.0f;
+
+    for (int i = 0; i < 3; ++i) {
+        Material m_temp = base_mat.with_temp_mode(modes[i]);
+        Vec2 m0_v0 = solve_bvp_material(bs, steps, 0.0f, 0.0f, 0.0f, angle_rad, m_temp, tension_N);
+
+        float max_eps = 0.0f, avg_eps = 0.0f, tip_eps = 0.0f, root_eps = 0.0f, min_mbr = 1000.0f, m0_kNm = 0.0f;
+        evaluate_candidate_single(bs, m_temp, steps, angle_rad, tension_N,
+                                  max_eps, avg_eps, tip_eps, root_eps, min_mbr, m0_kNm);
+
+        float v0_kN = std::fabs(m0_v0.y) / 1000.0f;
+        float n0_kN = std::fabs(tension_kN) * std::max(0.0f, std::cos(angle_rad));
+        bool row_pass = (max_eps <= bs.allowable_strain) && (min_mbr >= bs.allowable_mbr_m);
+        float e0_mpa = get_material_E(0.0f, m_temp) / 1e6f;
+
+        env.rows[i] = {
+            labels[i],
+            temps_c[i],
+            e0_mpa,
+            max_eps,
+            min_mbr,
+            m0_kNm,
+            v0_kN,
+            n0_kN,
+            row_pass
+        };
+
+        if (!row_pass) env.all_pass = false;
+        if (max_eps > env.governing_strain) env.governing_strain = max_eps;
+        if (min_mbr < env.governing_min_mbr_m) env.governing_min_mbr_m = min_mbr;
+        if (m0_kNm > env.governing_root_moment_kNm) env.governing_root_moment_kNm = m0_kNm;
+        if (v0_kN > env.governing_root_shear_kN) env.governing_root_shear_kN = v0_kN;
+        if (n0_kN > env.governing_root_axial_kN) env.governing_root_axial_kN = n0_kN;
+    }
+    return env;
+}
+
+// Save and Load project state (.bsproj text format)
+inline bool save_project_file(const char* filename,
+                              const BendStiffner &bs,
+                              const Material &mat,
+                              const OptimizationConfig &opt_cfg,
+                              float target_angle_deg,
+                              float target_tension_kN,
+                              const Vec1<float> &pairs_angles_deg,
+                              const Vec1<float> &pairs_tensions_kN) {
+    FILE* f = std::fopen(filename, "w");
+    if (!f) return false;
+
+    std::fprintf(f, "BS_PROJECT_V2\n");
+    std::fprintf(f, "geometry %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d\n",
+                 bs.length, bs.root_dia, bs.tip_dia, bs.inner_dia,
+                 bs.root_cyl_length, bs.pipe_EI_kNm2, bs.allowable_strain, bs.allowable_mbr_m,
+                 (int)bs.use_arc_length, (int)bs.use_far_field_bc);
+    std::fprintf(f, "loading %.6f %.6f\n", target_angle_deg, target_tension_kN);
+    std::fprintf(f, "optimizer %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d %d\n",
+                 opt_cfg.min_length, opt_cfg.max_length, opt_cfg.min_root_dia, opt_cfg.max_root_dia,
+                 opt_cfg.cyl_length_ratio, opt_cfg.safety_margin, opt_cfg.min_root_stiffness_ratio,
+                 (int)opt_cfg.optimize_length, (int)opt_cfg.optimize_root_dia,
+                 (int)opt_cfg.use_all_pairs, (int)opt_cfg.force_far_field_when_tension,
+                 (int)opt_cfg.include_temp_envelope);
+
+    size_t n_mat = mat.strain_table.count;
+    std::fprintf(f, "material_v2 %d %d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %zu\n",
+                 (int)mat.is_nonlinear, (int)mat.table_is_tangent_modulus,
+                 (int)mat.use_cross_section_integration, mat.active_temp_mode,
+                 mat.temp_nominal_c, mat.temp_cold_c, mat.temp_hot_c,
+                 mat.linear_E_nominal_kpa, mat.linear_E_cold_kpa, mat.linear_E_hot_kpa, n_mat);
+    for (size_t i = 0; i < n_mat; ++i) {
+        float en = (i < mat.emod_nominal_kpa.count) ? mat.emod_nominal_kpa.items[i] : 215800.0f;
+        float ec = (i < mat.emod_cold_kpa.count) ? mat.emod_cold_kpa.items[i] : en;
+        float eh = (i < mat.emod_hot_kpa.count) ? mat.emod_hot_kpa.items[i] : en;
+        std::fprintf(f, "mat_row_v2 %.6f %.6f %.6f %.6f\n", mat.strain_table.items[i], en, ec, eh);
+    }
+
+    size_t n_pairs = std::min(pairs_angles_deg.count, pairs_tensions_kN.count);
+    std::fprintf(f, "pairs %zu\n", n_pairs);
+    for (size_t i = 0; i < n_pairs; ++i) {
+        std::fprintf(f, "pair_row %.6f %.6f\n", pairs_angles_deg.items[i], pairs_tensions_kN.items[i]);
+    }
+    std::fclose(f);
+    return true;
+}
+
+inline bool load_project_file(const char* filename,
+                              BendStiffner &bs,
+                              Material &mat,
+                              OptimizationConfig &opt_cfg,
+                              float &target_angle_deg,
+                              float &target_tension_kN,
+                              Vec1<float> &pairs_angles_deg,
+                              Vec1<float> &pairs_tensions_kN) {
+    FILE* f = std::fopen(filename, "r");
+    if (!f) return false;
+
+    char header[64] = { 0 };
+    if (std::fscanf(f, "%63s", header) != 1 ||
+        (std::strcmp(header, "BS_PROJECT_V1") != 0 && std::strcmp(header, "BS_PROJECT_V2") != 0)) {
+        std::fclose(f);
+        return false;
+    }
+
+    char tag[64] = { 0 };
+    while (std::fscanf(f, "%63s", tag) == 1) {
+        if (std::strcmp(tag, "geometry") == 0) {
+            int arc = 1, ff = 0;
+            if (std::fscanf(f, "%f %f %f %f %f %f %f %f %d %d",
+                            &bs.length, &bs.root_dia, &bs.tip_dia, &bs.inner_dia,
+                            &bs.root_cyl_length, &bs.pipe_EI_kNm2, &bs.allowable_strain, &bs.allowable_mbr_m,
+                            &arc, &ff) == 10) {
+                bs.use_arc_length = (arc != 0);
+                bs.use_far_field_bc = (ff != 0);
+            }
+        } else if (std::strcmp(tag, "loading") == 0) {
+            std::fscanf(f, "%f %f", &target_angle_deg, &target_tension_kN);
+        } else if (std::strcmp(tag, "optimizer") == 0) {
+            int ol = 1, odr = 1, uap = 0, fff = 1, ite = 0;
+            if (std::fscanf(f, "%f %f %f %f %f %f %f %d %d %d %d %d",
+                            &opt_cfg.min_length, &opt_cfg.max_length, &opt_cfg.min_root_dia, &opt_cfg.max_root_dia,
+                            &opt_cfg.cyl_length_ratio, &opt_cfg.safety_margin, &opt_cfg.min_root_stiffness_ratio,
+                            &ol, &odr, &uap, &fff, &ite) == 12) {
+                opt_cfg.optimize_length = (ol != 0);
+                opt_cfg.optimize_root_dia = (odr != 0);
+                opt_cfg.use_all_pairs = (uap != 0);
+                opt_cfg.force_far_field_when_tension = (fff != 0);
+                opt_cfg.include_temp_envelope = (ite != 0);
+            }
+        } else if (std::strcmp(tag, "material_v2") == 0) {
+            int nl = 1, tan_m = 1, csi = 0, act_mode = 0;
+            size_t n_mat = 0;
+            if (std::fscanf(f, "%d %d %d %d %f %f %f %f %f %f %zu",
+                            &nl, &tan_m, &csi, &act_mode,
+                            &mat.temp_nominal_c, &mat.temp_cold_c, &mat.temp_hot_c,
+                            &mat.linear_E_nominal_kpa, &mat.linear_E_cold_kpa, &mat.linear_E_hot_kpa,
+                            &n_mat) == 11) {
+                mat.is_nonlinear = (nl != 0);
+                mat.table_is_tangent_modulus = (tan_m != 0);
+                mat.use_cross_section_integration = (csi != 0);
+                mat.strain_table.clear();
+                mat.emod_nominal_kpa.clear();
+                mat.emod_cold_kpa.clear();
+                mat.emod_hot_kpa.clear();
+                for (size_t i = 0; i < n_mat; ++i) {
+                    char rtag[32] = { 0 };
+                    float s_v = 0.0f, en = 0.0f, ec = 0.0f, eh = 0.0f;
+                    if (std::fscanf(f, "%31s %f %f %f %f", rtag, &s_v, &en, &ec, &eh) == 5) {
+                        mat.strain_table.append(s_v);
+                        mat.emod_nominal_kpa.append(en);
+                        mat.emod_cold_kpa.append(ec);
+                        mat.emod_hot_kpa.append(eh);
+                    }
+                }
+                mat.set_active_temp_mode(act_mode);
+            }
+        } else if (std::strcmp(tag, "material") == 0) {
+            int nl = 1, tan_m = 1, csi = 0;
+            size_t n_mat = 0;
+            if (std::fscanf(f, "%d %d %d %f %zu", &nl, &tan_m, &csi, &mat.linear_E_nominal_kpa, &n_mat) == 5) {
+                mat.is_nonlinear = (nl != 0);
+                mat.table_is_tangent_modulus = (tan_m != 0);
+                mat.use_cross_section_integration = (csi != 0);
+                mat.strain_table.clear();
+                mat.emod_nominal_kpa.clear();
+                mat.emod_cold_kpa.clear();
+                mat.emod_hot_kpa.clear();
+                for (size_t i = 0; i < n_mat; ++i) {
+                    char rtag[32] = { 0 };
+                    float s_v = 0.0f, e_v = 0.0f;
+                    if (std::fscanf(f, "%31s %f %f", rtag, &s_v, &e_v) == 3) {
+                        mat.strain_table.append(s_v);
+                        mat.emod_nominal_kpa.append(e_v);
+                        mat.emod_cold_kpa.append(e_v * 1.35f);
+                        mat.emod_hot_kpa.append(e_v * 0.75f);
+                    }
+                }
+                mat.set_active_temp_mode(MAT_TEMP_NOMINAL);
+            }
+        } else if (std::strcmp(tag, "pairs") == 0) {
+            size_t n_pairs = 0;
+            if (std::fscanf(f, "%zu", &n_pairs) == 1) {
+                pairs_angles_deg.clear();
+                pairs_tensions_kN.clear();
+                for (size_t i = 0; i < n_pairs; ++i) {
+                    char rtag[32] = { 0 };
+                    float a_v = 0.0f, t_v = 0.0f;
+                    if (std::fscanf(f, "%31s %f %f", rtag, &a_v, &t_v) == 3) {
+                        pairs_angles_deg.append(a_v);
+                        pairs_tensions_kN.append(t_v);
+                    }
+                }
+            }
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
 

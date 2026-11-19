@@ -78,6 +78,93 @@ void ParseTwoColumns(Vec1<float> &data1, Vec1<float> &data2, const char* clipboa
     }
 }
 
+// Parses either 4 columns (Strain, Nominal_E, Cold_E, Hot_E) or 2 columns (Strain, Active_Temp_E) from Excel clipboard
+int ParseMaterialClipboard(Material &mat, const char* clipboard_data) {
+    if (!clipboard_data || std::strlen(clipboard_data) == 0) return 0;
+
+    Vec1<float> col_s(32), col_n(32), col_c(32), col_h(32);
+    size_t length = std::strlen(clipboard_data);
+    size_t line_start = 0;
+    int max_cols_found = 0;
+
+    for (size_t i = 0; i <= length; ++i) {
+        char c = (i < length) ? clipboard_data[i] : '\n';
+        if (c == '\n' || c == '\r') {
+            if (c == '\r' && (i + 1 < length) && clipboard_data[i + 1] == '\n') {
+                i++;
+            }
+            // Parse tab-separated tokens on this line
+            float vals[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            int col_count = 0;
+            size_t tok_start = line_start;
+            for (size_t j = line_start; j <= i && col_count < 4; ++j) {
+                char tc = (j < i && clipboard_data[j] != '\r') ? clipboard_data[j] : '\t';
+                if (tc == '\t') {
+                    if (j > tok_start) {
+                        char* endptr = nullptr;
+                        float v = std::strtof(clipboard_data + tok_start, &endptr);
+                        if (endptr != clipboard_data + tok_start) {
+                            vals[col_count++] = v;
+                        }
+                    }
+                    tok_start = j + 1;
+                }
+            }
+            if (col_count >= 4) {
+                col_s.append(vals[0]);
+                col_n.append(vals[1]);
+                col_c.append(vals[2]);
+                col_h.append(vals[3]);
+                if (4 > max_cols_found) max_cols_found = 4;
+            } else if (col_count >= 2) {
+                col_s.append(vals[0]);
+                col_n.append(vals[1]);
+                if (2 > max_cols_found) max_cols_found = 2;
+            }
+            line_start = i + 1;
+        }
+    }
+
+    if (col_s.count < 2) return 0;
+
+    if (max_cols_found >= 4 && col_c.count == col_s.count && col_h.count == col_s.count) {
+        mat.strain_table = col_s;
+        mat.emod_nominal_kpa = col_n;
+        mat.emod_cold_kpa = col_c;
+        mat.emod_hot_kpa = col_h;
+        mat.linear_E_nominal_kpa = col_n.items[0];
+        mat.linear_E_cold_kpa = col_c.items[0];
+        mat.linear_E_hot_kpa = col_h.items[0];
+        mat.sync_active_table();
+        return 4;
+    }
+
+    // 2-column paste: update strain_table (and resize other temp tables if count changed) and set active temp curve
+    bool same_count = (col_s.count == mat.strain_table.count);
+    mat.strain_table = col_s;
+    if (!same_count) {
+        mat.emod_nominal_kpa = col_n;
+        mat.emod_cold_kpa = col_n;
+        mat.emod_hot_kpa = col_n;
+        for (size_t k = 0; k < col_n.count; ++k) {
+            mat.emod_cold_kpa.items[k] = col_n.items[k] * 1.35f;
+            mat.emod_hot_kpa.items[k] = col_n.items[k] * 0.75f;
+        }
+    }
+    if (mat.active_temp_mode == MAT_TEMP_COLD) {
+        mat.emod_cold_kpa = col_n;
+        mat.linear_E_cold_kpa = col_n.items[0];
+    } else if (mat.active_temp_mode == MAT_TEMP_HOT) {
+        mat.emod_hot_kpa = col_n;
+        mat.linear_E_hot_kpa = col_n.items[0];
+    } else {
+        mat.emod_nominal_kpa = col_n;
+        mat.linear_E_nominal_kpa = col_n.items[0];
+    }
+    mat.sync_active_table();
+    return 2;
+}
+
 bool solve(float target_angle,
            BendStiffner &bs,
            Vec1<Vec1<float>> &results,
@@ -314,11 +401,25 @@ int main()
     float def_bot_x[DISCRETIZATION] = { 0.0f };
     float def_bot_y[DISCRETIZATION] = { 0.0f };
 
+    // Bare flexible pipe tail arrays (s in [L, L + L_tail])
+    float tail_s[TAIL_NODES] = { 0.0f };
+    float tail_x[TAIL_NODES] = { 0.0f };
+    float tail_y[TAIL_NODES] = { 0.0f };
+    float tail_theta[TAIL_NODES] = { 0.0f };
+    float tail_moment_kNm[TAIL_NODES] = { 0.0f };
+    float tail_curvature[TAIL_NODES] = { 0.0f };
+    float tail_mbr[TAIL_NODES] = { 0.0f };
+    float tail_top_x[TAIL_NODES] = { 0.0f };
+    float tail_top_y[TAIL_NODES] = { 0.0f };
+    float tail_bot_x[TAIL_NODES] = { 0.0f };
+    float tail_bot_y[TAIL_NODES] = { 0.0f };
+
     bool solved = false;
     bool extract_results = true;
     bool show_input_window = false;
     bool show_material_window = false;
     bool show_optimizer_window = false;
+    bool show_temp_env_window = false;
     bool data_pasted = false;
     bool plot_bs = true;
     bool plot_deformed = true;
@@ -330,10 +431,55 @@ int main()
     double last_opt_ms = 0.0;
     OptimizationConfig opt_cfg;
     OptimizationResult last_opt_res;
+    TemperatureEnvelopeSummary temp_env;
+    char project_filename[128] = "project.bsproj";
     std::string status_message = "Ready. Click 'Calculate Strain' or 'Optimize Size' to run.";
 
     Vec1<float> data1(256); // Angle, deg
     Vec1<float> data2(256); // Tension, kN
+
+    auto update_post_solve_data = [&]() {
+        float step = (DISCRETIZATION > 1) ? (bs.length / (float)(DISCRETIZATION - 1)) : 0.0f;
+        for (int i = 0; i < DISCRETIZATION; i++)
+        {
+            float s_i = (float)i * step;
+            length[i] = s_i;
+            deflection_y[i] = results.items[i].items[0];
+            float theta_i = results.items[i].items[1];
+            moment_kNm[i] = results.items[i].items[2] / 1000.0f;
+            float r_o = 0.5f * get_dia(bs, s_i);
+            float nx = -std::sin(theta_i);
+            float ny = std::cos(theta_i);
+            def_top_x[i] = x_coords.items[i] + r_o * nx;
+            def_top_y[i] = deflection_y[i] + r_o * ny;
+            def_bot_x[i] = x_coords.items[i] - r_o * nx;
+            def_bot_y[i] = deflection_y[i] - r_o * ny;
+        }
+
+        // Simulate bare flexible pipe tail beyond the tip (s in [L, L + L_tail])
+        float tail_len = std::clamp(0.60f * bs.length, 0.8f, 2.5f);
+        float tip_x = x_coords.items[DISCRETIZATION - 1];
+        float tip_y = deflection_y[DISCRETIZATION - 1];
+        float tip_theta = results.items[DISCRETIZATION - 1].items[1];
+        float tip_m_Nm = results.items[DISCRETIZATION - 1].items[2];
+        float rad = (3.14159265358979323846f / 180.0f) * target_angle_deg;
+        simulate_bare_pipe_tail(bs, tip_x, tip_y, tip_theta, tip_m_Nm,
+                                target_tension_kN * 1000.0f, rad, tail_len,
+                                tail_s, tail_x, tail_y, tail_theta,
+                                tail_moment_kNm, tail_curvature, tail_mbr);
+        float r_pipe = 0.5f * bs.inner_dia;
+        for (int i = 0; i < TAIL_NODES; ++i) {
+            float nx = -std::sin(tail_theta[i]);
+            float ny = std::cos(tail_theta[i]);
+            tail_top_x[i] = tail_x[i] + r_pipe * nx;
+            tail_top_y[i] = tail_y[i] + r_pipe * ny;
+            tail_bot_x[i] = tail_x[i] - r_pipe * nx;
+            tail_bot_y[i] = tail_y[i] - r_pipe * ny;
+        }
+
+        // Evaluate Cold (4C) / Nominal (20C) / Warm (35C) temperature envelope & hang-off reactions
+        temp_env = evaluate_temperature_envelope(bs, material, target_angle_deg, target_tension_kN);
+    };
 
     // ###########################################################################################
     bool done = false;
@@ -419,6 +565,20 @@ int main()
 
         ImGui::Checkbox("Non-Linear Material (PU)", &material.is_nonlinear);
         ImGui::SameLine();
+        ImGui::Text("Active Temp:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Nominal", material.active_temp_mode == MAT_TEMP_NOMINAL)) {
+            material.set_active_temp_mode(MAT_TEMP_NOMINAL);
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Cold", material.active_temp_mode == MAT_TEMP_COLD)) {
+            material.set_active_temp_mode(MAT_TEMP_COLD);
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Hot", material.active_temp_mode == MAT_TEMP_HOT)) {
+            material.set_active_temp_mode(MAT_TEMP_HOT);
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Material Properties...")) {
             show_material_window = true;
         }
@@ -429,6 +589,44 @@ int main()
         ImGui::SameLine();
         if (ImGui::Button("Size Optimizer Settings...")) {
             show_optimizer_window = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Temp Envelope & Reactions...")) {
+            temp_env = evaluate_temperature_envelope(bs, material, target_angle_deg, target_tension_kN);
+            show_temp_env_window = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Copy OrcaFlex Geometry")) {
+            char buf[256];
+            std::string tsv = "ProfileLength_m\tOuterDia_m\tInnerDia_m\n";
+            snprintf(buf, sizeof(buf), "%.4f\t%.4f\t%.4f\n", 0.0f, bs.root_dia, bs.inner_dia);
+            tsv += buf;
+            if (bs.root_cyl_length > 1e-4f && bs.root_cyl_length < bs.length) {
+                snprintf(buf, sizeof(buf), "%.4f\t%.4f\t%.4f\n", bs.root_cyl_length, bs.root_dia, bs.inner_dia);
+                tsv += buf;
+            }
+            snprintf(buf, sizeof(buf), "%.4f\t%.4f\t%.4f\n", bs.length, bs.tip_dia, bs.inner_dia);
+            tsv += buf;
+            ImGui::SetClipboardText(tsv.c_str());
+            status_message = "Copied Bend Stiffener Geometry table for OrcaFlex to clipboard.";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save Project")) {
+            if (save_project_file(project_filename, bs, material, opt_cfg, target_angle_deg, target_tension_kN, data1, data2)) {
+                status_message = std::string("Saved project to '") + project_filename + "'.";
+            } else {
+                status_message = "Error: Could not save project file.";
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load Project")) {
+            if (load_project_file(project_filename, bs, material, opt_cfg, target_angle_deg, target_tension_kN, data1, data2)) {
+                allowable_strain_pct = bs.allowable_strain * 100.0f;
+                data_pasted = (data1.count > 0);
+                status_message = std::string("Loaded project from '") + project_filename + "'.";
+            } else {
+                status_message = std::string("No existing '") + project_filename + "' found to load.";
+            }
         }
         ImGui::SameLine();
         ImGui::TextDisabled("| PU Mass: %.1f kg (%.3f m3)", get_pu_mass_kg(bs), get_pu_volume_m3(bs));
@@ -453,34 +651,20 @@ int main()
                                &x_coords, &curvature, &bend_radius, &last_solve_ms, true);
                 extract_results = solved;
                 if (solved) {
-                    float step = (DISCRETIZATION > 1) ? (bs.length / (float)(DISCRETIZATION - 1)) : 0.0f;
-                    for (int i = 0; i < DISCRETIZATION; i++)
-                    {
-                        float s_i = (float)i * step;
-                        length[i] = s_i;
-                        deflection_y[i] = results.items[i].items[0];
-                        float theta_i = results.items[i].items[1];
-                        moment_kNm[i] = results.items[i].items[2] / 1000.0f;
-                        float r_o = 0.5f * get_dia(bs, s_i);
-                        float nx = -std::sin(theta_i);
-                        float ny = std::cos(theta_i);
-                        def_top_x[i] = x_coords.items[i] + r_o * nx;
-                        def_top_y[i] = deflection_y[i] + r_o * ny;
-                        def_bot_x[i] = x_coords.items[i] - r_o * nx;
-                        def_bot_y[i] = deflection_y[i] - r_o * ny;
-                    }
+                    update_post_solve_data();
                     float max_eps = strain.max_pos();
                     float min_mbr = bend_radius.min_pos(1000.0f);
                     bool pass_strain = (max_eps <= bs.allowable_strain);
                     bool pass_mbr = (min_mbr >= bs.allowable_mbr_m);
-                    char buf[320];
+                    float v0_kN = std::fabs(results.items[0].items[3]) / 1000.0f;
+                    char buf[340];
                     snprintf(buf, sizeof(buf),
-                             "[%s] Solved in %.3f ms | Max Strain: %.2f%% (Allow %.1f%%) | Min MBR: %.2f m (Allow %.2f m) | Root M0: %.2f kN.m | Tip (X,Y): (%.2f, %.2f) m",
+                             "[%s] Solved in %.3f ms | Max Strain: %.2f%% (Allow %.1f%%) | Min MBR: %.2f m (Allow %.2f m) | Root M0: %.2f kN.m, V0: %.1f kN | Tip (X,Y): (%.2f, %.2f) m",
                              (pass_strain && pass_mbr) ? "PASS" : "FAIL",
                              last_solve_ms,
                              max_eps * 100.0f, bs.allowable_strain * 100.0f,
                              min_mbr, bs.allowable_mbr_m,
-                             results.items[0].items[2] / 1000.0f,
+                             results.items[0].items[2] / 1000.0f, v0_kN,
                              x_coords.items[DISCRETIZATION - 1],
                              results.items[DISCRETIZATION - 1].items[0]);
                     status_message = buf;
@@ -506,22 +690,7 @@ int main()
                            &x_coords, &curvature, &bend_radius, &last_solve_ms, true);
             extract_results = solved;
             if (solved) {
-                float step = (DISCRETIZATION > 1) ? (bs.length / (float)(DISCRETIZATION - 1)) : 0.0f;
-                for (int i = 0; i < DISCRETIZATION; i++)
-                {
-                    float s_i = (float)i * step;
-                    length[i] = s_i;
-                    deflection_y[i] = results.items[i].items[0];
-                    float theta_i = results.items[i].items[1];
-                    moment_kNm[i] = results.items[i].items[2] / 1000.0f;
-                    float r_o = 0.5f * get_dia(bs, s_i);
-                    float nx = -std::sin(theta_i);
-                    float ny = std::cos(theta_i);
-                    def_top_x[i] = x_coords.items[i] + r_o * nx;
-                    def_top_y[i] = deflection_y[i] + r_o * ny;
-                    def_bot_x[i] = x_coords.items[i] - r_o * nx;
-                    def_bot_y[i] = deflection_y[i] - r_o * ny;
-                }
+                update_post_solve_data();
             }
             if (opt_cfg.use_all_pairs && data1.count > 0) {
                 solve_pairs(strain_maxs, pair_min_mbrs, pair_root_moments_kNm,
@@ -627,10 +796,11 @@ int main()
 
         if (plot_bs)
         {
-            if (ImPlot::BeginPlot("Bend Stiffener Geometry & 2D Deformed Shape", ImVec2(-1, plot_height))) {
+            if (ImPlot::BeginPlot("Bend Stiffener Geometry & 2D Deformed Shape (with Exiting Bare Pipe Tail)", ImVec2(-1, plot_height))) {
                 ImPlot::SetupAxes("Axial Position X [m]", "Transverse Position Y [m]");
-                float max_y_extent = std::max(0.65f * bs.root_dia, solved ? (std::fabs(deflection_y[DISCRETIZATION - 1]) + bs.root_dia) : (0.65f * bs.root_dia));
-                ImPlot::SetupAxesLimits(-0.05 * bs.length, bs.length * 1.05, -max_y_extent, max_y_extent, ImGuiCond_Once);
+                float max_x_extent = solved ? std::max(bs.length * 1.15f, tail_x[TAIL_NODES - 1] * 1.05f) : (bs.length * 1.10f);
+                float max_y_extent = std::max(0.65f * bs.root_dia, solved ? (std::fabs(tail_y[TAIL_NODES - 1]) + bs.root_dia) : (0.65f * bs.root_dia));
+                ImPlot::SetupAxesLimits(-0.05 * bs.length, max_x_extent, -max_y_extent, max_y_extent, ImGuiCond_Once);
                 ImPlotSpec spec;
                 spec.LineWeight = 2.0f * main_scale;
                 ImPlot::PlotLine("Undeformed Cone", x_data, y_data, 7, spec);
@@ -642,11 +812,20 @@ int main()
                 if (solved && plot_deformed) {
                     ImPlotSpec def_center_spec;
                     def_center_spec.LineWeight = 2.2f * main_scale;
-                    ImPlot::PlotLine("Deformed Centerline", x_coords.items, deflection_y, DISCRETIZATION, def_center_spec);
+                    ImPlot::PlotLine("Deformed BS Centerline", x_coords.items, deflection_y, DISCRETIZATION, def_center_spec);
                     ImPlotSpec def_wall_spec;
                     def_wall_spec.LineWeight = 1.6f * main_scale;
-                    ImPlot::PlotLine("Deformed Upper Surface", def_top_x, def_top_y, DISCRETIZATION, def_wall_spec);
-                    ImPlot::PlotLine("Deformed Lower Surface", def_bot_x, def_bot_y, DISCRETIZATION, def_wall_spec);
+                    ImPlot::PlotLine("Deformed BS Upper Wall", def_top_x, def_top_y, DISCRETIZATION, def_wall_spec);
+                    ImPlot::PlotLine("Deformed BS Lower Wall", def_bot_x, def_bot_y, DISCRETIZATION, def_wall_spec);
+
+                    // Exiting bare flexible pipe tail (s in [L, L + L_tail])
+                    ImPlotSpec tail_spec;
+                    tail_spec.LineWeight = 2.0f * main_scale;
+                    ImPlot::PlotLine("Exiting Pipe Centerline", tail_x, tail_y, TAIL_NODES, tail_spec);
+                    ImPlotSpec tail_wall_spec;
+                    tail_wall_spec.LineWeight = 1.2f * main_scale;
+                    ImPlot::PlotLine("Exiting Pipe Wall (+)", tail_top_x, tail_top_y, TAIL_NODES, tail_wall_spec);
+                    ImPlot::PlotLine("Exiting Pipe Wall (-)", tail_bot_x, tail_bot_y, TAIL_NODES, tail_wall_spec);
                 }
                 ImPlot::EndPlot();
             }
@@ -672,14 +851,15 @@ int main()
 
             if (plot_curvature)
             {
-                if (ImPlot::BeginPlot("Curvature & Minimum Bend Radius (MBR) Verification", ImVec2(-1, plot_height))) {
+                if (ImPlot::BeginPlot("Curvature & Minimum Bend Radius (MBR) Verification (Inside BS + Exiting Pipe Tail)", ImVec2(-1, plot_height))) {
                     ImPlot::SetupAxes("Arc Length from Root s [m]", "Curvature kappa [1/m]");
                     ImPlotSpec spec_k;
                     spec_k.LineWeight = 2.0f * main_scale;
-                    ImPlot::PlotLine("Curvature [1/m]", length, curvature.items, DISCRETIZATION, spec_k);
+                    ImPlot::PlotLine("Curvature Inside BS [0..L]", length, curvature.items, DISCRETIZATION, spec_k);
+                    ImPlot::PlotLine("Exiting Bare Pipe Tail [L..L+tail]", tail_s, tail_curvature, TAIL_NODES, spec_k);
 
                     float max_allow_kappa = (bs.allowable_mbr_m > 1e-4f) ? (1.0f / bs.allowable_mbr_m) : 1.0f;
-                    float lim_x[2] = { 0.0f, bs.length };
+                    float lim_x[2] = { 0.0f, tail_s[TAIL_NODES - 1] };
                     float lim_k[2] = { max_allow_kappa, max_allow_kappa };
                     ImPlotSpec lim_spec;
                     lim_spec.LineWeight = 1.8f * main_scale;
@@ -690,11 +870,12 @@ int main()
 
             if (plot_moment)
             {
-                if (ImPlot::BeginPlot("Bending Moment Distribution", ImVec2(-1, plot_height))) {
+                if (ImPlot::BeginPlot("Bending Moment Distribution (Inside BS + Exiting Pipe Tail)", ImVec2(-1, plot_height))) {
                     ImPlot::SetupAxes("Arc Length from Root s [m]", "Bending Moment [kN.m]");
                     ImPlotSpec spec_m;
                     spec_m.LineWeight = 2.0f * main_scale;
-                    ImPlot::PlotLine("Bending Moment [kN.m]", length, moment_kNm, DISCRETIZATION, spec_m);
+                    ImPlot::PlotLine("Bending Moment Inside BS [kN.m]", length, moment_kNm, DISCRETIZATION, spec_m);
+                    ImPlot::PlotLine("Exiting Bare Pipe Moment [kN.m]", tail_s, tail_moment_kNm, TAIL_NODES, spec_m);
                     ImPlot::EndPlot();
                 }
             }
@@ -874,86 +1055,193 @@ int main()
         // --- Modal / Floating Window 2: Material Properties Configuration ---
         if (show_material_window)
         {
-            ImGui::SetNextWindowSize(ImVec2(580 * main_scale, 510 * main_scale), ImGuiCond_FirstUseEver);
-            ImGui::Begin("Material Properties & Temperature Presets", &show_material_window);
+            ImGui::SetNextWindowSize(ImVec2(760 * main_scale, 680 * main_scale), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Temperature-Specific Material Properties (Nominal / Cold / Hot)", &show_material_window);
 
             if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
                 ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V))
             {
                 const char* clipboardData = ImGui::GetClipboardText();
                 if (clipboardData) {
-                    Vec1<float> new_strain(32);
-                    Vec1<float> new_emod(32);
-                    ParseTwoColumns(new_strain, new_emod, clipboardData);
-                    if (new_strain.count >= 2 && new_strain.count == new_emod.count) {
-                        material.strain_table = new_strain;
-                        material.emod_table_kpa = new_emod;
-                        material.linear_E_kpa = new_emod.items[0];
-                        status_message = "Pasted custom non-linear material table from clipboard.";
+                    int cols_pasted = ParseMaterialClipboard(material, clipboardData);
+                    if (cols_pasted == 4) {
+                        status_message = "Pasted 4-column (Strain, Nominal E, Cold E, Hot E) table from clipboard.";
+                    } else if (cols_pasted == 2) {
+                        status_message = "Pasted 2-column (Strain, E) table into the active temperature curve.";
                     }
                 }
             }
 
+            ImGui::SeparatorText("Active Operating Temperature & Reference Temperatures");
+            if (ImGui::RadioButton("Nominal Temp", material.active_temp_mode == MAT_TEMP_NOMINAL)) {
+                material.set_active_temp_mode(MAT_TEMP_NOMINAL);
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Cold Temp", material.active_temp_mode == MAT_TEMP_COLD)) {
+                material.set_active_temp_mode(MAT_TEMP_COLD);
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Hot Temp", material.active_temp_mode == MAT_TEMP_HOT)) {
+                material.set_active_temp_mode(MAT_TEMP_HOT);
+            }
+
+            ImGui::PushItemWidth(110.0f * main_scale);
+            ImGui::InputFloat("Nominal [C]", &material.temp_nominal_c, 1.0f, 5.0f, "%.1f");
+            ImGui::SameLine();
+            ImGui::InputFloat("Cold [C]", &material.temp_cold_c, 1.0f, 5.0f, "%.1f");
+            ImGui::SameLine();
+            ImGui::InputFloat("Hot [C]", &material.temp_hot_c, 1.0f, 5.0f, "%.1f");
+            ImGui::PopItemWidth();
+
+            ImGui::SeparatorText("Constitutive Model & E-Modulus Input");
             ImGui::Checkbox("Enable Non-Linear Material Curve", &material.is_nonlinear);
             if (!material.is_nonlinear) {
-                ImGui::InputFloat("Linear Young's Modulus E [kPa]", &material.linear_E_kpa, 1000.0f, 10000.0f, "%.1f");
+                ImGui::PushItemWidth(180.0f * main_scale);
+                if (ImGui::InputFloat("Nominal Young's Modulus E [kPa]", &material.linear_E_nominal_kpa, 1000.0f, 10000.0f, "%.1f")) {
+                    material.sync_active_table();
+                }
+                if (ImGui::InputFloat("Cold Young's Modulus E [kPa]", &material.linear_E_cold_kpa, 1000.0f, 10000.0f, "%.1f")) {
+                    material.sync_active_table();
+                }
+                if (ImGui::InputFloat("Hot Young's Modulus E [kPa]", &material.linear_E_hot_kpa, 1000.0f, 10000.0f, "%.1f")) {
+                    material.sync_active_table();
+                }
+                ImGui::PopItemWidth();
             } else {
                 ImGui::Checkbox("Table values are Tangent Modulus d(sigma)/d(strain) [integrated for Secant E]", &material.table_is_tangent_modulus);
                 ImGui::Checkbox("Cross-Sectional Annular Stress Integration (4-pt Gauss quadrature)", &material.use_cross_section_integration);
 
-                ImGui::Text("Temperature / Stiffness Presets:");
-                if (ImGui::Button("Nominal PU (20 C)")) {
-                    material.reset_to_default(1.0f);
+                ImGui::TextWrapped("Tip: Press Ctrl+V to paste either 4 columns (Strain, Nominal E, Cold E, Hot E) or 2 columns (Strain, Active Temp E) from Excel.");
+                if (ImGui::Button("Reset All to Default Polyurethane (20C / 4C / 35C)")) {
+                    material.reset_to_default(1.0f, 1.35f, 0.75f);
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Cold Water PU (4 C, 1.35x)")) {
-                    material.reset_to_default(1.35f);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Warm / Quasi-Static PU (35 C, 0.75x)")) {
-                    material.reset_to_default(0.75f);
-                }
-
-                ImGui::TextWrapped("Focus this window and press Ctrl+V to paste a 2-column (Strain [-], E-Modulus [kPa]) table from Excel.");
-                if (ImGui::Button("Add Point")) {
-                    float next_s = (material.strain_table.count > 0)
-                        ? (material.strain_table.items[material.strain_table.count - 1] + 0.01f)
-                        : 0.0f;
-                    float last_e = (material.emod_table_kpa.count > 0)
-                        ? material.emod_table_kpa.items[material.emod_table_kpa.count - 1]
-                        : 215800.0f;
+                if (ImGui::Button("Add Row")) {
+                    size_t n = material.strain_table.count;
+                    float next_s = (n > 0) ? (material.strain_table.items[n - 1] + 0.01f) : 0.0f;
+                    float last_en = (material.emod_nominal_kpa.count > 0) ? material.emod_nominal_kpa.items[material.emod_nominal_kpa.count - 1] : 215800.0f;
+                    float last_ec = (material.emod_cold_kpa.count > 0) ? material.emod_cold_kpa.items[material.emod_cold_kpa.count - 1] : (last_en * 1.35f);
+                    float last_eh = (material.emod_hot_kpa.count > 0) ? material.emod_hot_kpa.items[material.emod_hot_kpa.count - 1] : (last_en * 0.75f);
                     material.strain_table.append(next_s);
-                    material.emod_table_kpa.append(last_e);
+                    material.emod_nominal_kpa.append(last_en);
+                    material.emod_cold_kpa.append(last_ec);
+                    material.emod_hot_kpa.append(last_eh);
+                    material.sync_active_table();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Copy OrcaFlex Stress-Strain (Active Temp)")) {
+                    std::string tsv = "Strain_pct\tStress_kPa\tSecantE_kPa\n";
+                    char row[128];
+                    size_t n_mat = material.strain_table.count;
+                    for (size_t i = 0; i < n_mat; ++i) {
+                        float eps_i = material.strain_table.items[i];
+                        float esec_kpa = get_material_E(eps_i, material) / 1000.0f;
+                        float stress_kpa = eps_i * esec_kpa;
+                        snprintf(row, sizeof(row), "%.2f\t%.2f\t%.2f\n", eps_i * 100.0f, stress_kpa, esec_kpa);
+                        tsv += row;
+                    }
+                    ImGui::SetClipboardText(tsv.c_str());
+                    status_message = "Copied Active Temperature Stress-Strain curve for OrcaFlex to clipboard.";
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Close")) {
                     show_material_window = false;
                 }
 
-                if (ImGui::BeginTable("MaterialTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 290 * main_scale)))
+                // Live interactive Stress-Strain Plot showing Nominal, Cold, and Hot curves together
+                constexpr int N_CURVE = 41;
+                float curve_strain_pct[N_CURVE];
+                float curve_stress_nom[N_CURVE];
+                float curve_stress_cold[N_CURVE];
+                float curve_stress_hot[N_CURVE];
+                Material mat_nom = material.with_temp_mode(MAT_TEMP_NOMINAL);
+                Material mat_cold = material.with_temp_mode(MAT_TEMP_COLD);
+                Material mat_hot = material.with_temp_mode(MAT_TEMP_HOT);
+
+                for (int i = 0; i < N_CURVE; ++i) {
+                    float eps = 0.20f * (float)i / (float)(N_CURVE - 1);
+                    curve_strain_pct[i] = eps * 100.0f;
+                    curve_stress_nom[i]  = (eps * get_material_E(eps, mat_nom)) / 1e6f;
+                    curve_stress_cold[i] = (eps * get_material_E(eps, mat_cold)) / 1e6f;
+                    curve_stress_hot[i]  = (eps * get_material_E(eps, mat_hot)) / 1e6f;
+                }
+
+                if (ImPlot::BeginPlot("Temperature-Dependent Polyurethane Stress-Strain Curves (Cold / Nominal / Hot)", ImVec2(-1, 185 * main_scale))) {
+                    ImPlot::SetupAxes("Strain [%]", "Stress [MPa]");
+                    ImPlotSpec sp_c;
+                    sp_c.LineWeight = 2.0f * main_scale;
+                    ImPlot::PlotLine("Cold Stress [MPa]", curve_strain_pct, curve_stress_cold, N_CURVE, sp_c);
+                    ImPlot::PlotLine("Nominal Stress [MPa]", curve_strain_pct, curve_stress_nom, N_CURVE, sp_c);
+                    ImPlot::PlotLine("Hot Stress [MPa]", curve_strain_pct, curve_stress_hot, N_CURVE, sp_c);
+
+                    if (solved) {
+                        float op_eps = strain.max_pos();
+                        float op_pct = op_eps * 100.0f;
+                        float op_sig = (op_eps * get_material_E(op_eps, material)) / 1e6f;
+                        ImPlotSpec sp_op;
+                        sp_op.Marker = ImPlotMarker_Circle;
+                        sp_op.MarkerSize = 5.5f * main_scale;
+                        sp_op.LineWeight = 2.0f * main_scale;
+                        ImPlot::PlotScatter("Peak Operating Strain (Active Temp)", &op_pct, &op_sig, 1, sp_op);
+                    }
+                    ImPlot::EndPlot();
+                }
+
+                if (ImGui::BeginTable("MaterialTable", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 220 * main_scale)))
                 {
+                    char col_nom[64], col_cold[64], col_hot[64];
+                    snprintf(col_nom, sizeof(col_nom), "Nominal E (%.0f C) [kPa]", material.temp_nominal_c);
+                    snprintf(col_cold, sizeof(col_cold), "Cold E (%.0f C) [kPa]", material.temp_cold_c);
+                    snprintf(col_hot, sizeof(col_hot), "Hot E (%.0f C) [kPa]", material.temp_hot_c);
+
                     ImGui::TableSetupColumn("Strain [-]");
-                    ImGui::TableSetupColumn("Table E [kPa]");
-                    ImGui::TableSetupColumn("Effective Secant E [MPa]");
+                    ImGui::TableSetupColumn(col_nom);
+                    ImGui::TableSetupColumn(col_cold);
+                    ImGui::TableSetupColumn(col_hot);
+                    ImGui::TableSetupColumn("Active Secant E / Stress");
                     ImGui::TableHeadersRow();
 
-                    size_t n_mat = std::min(material.strain_table.count, material.emod_table_kpa.count);
+                    size_t n_mat = material.strain_table.count;
+                    bool edited = false;
                     for (size_t i = 0; i < n_mat; ++i)
                     {
                         ImGui::TableNextRow();
                         ImGui::TableNextColumn();
                         ImGui::PushID((int)i + 20000);
-                        ImGui::InputFloat("##mat_strain", &material.strain_table.items[i], 0.0f, 0.0f, "%.4f");
+                        if (ImGui::InputFloat("##mat_strain", &material.strain_table.items[i], 0.0f, 0.0f, "%.4f")) edited = true;
                         ImGui::PopID();
 
                         ImGui::TableNextColumn();
                         ImGui::PushID((int)i + 30000);
-                        ImGui::InputFloat("##mat_emod", &material.emod_table_kpa.items[i], 0.0f, 0.0f, "%.1f");
+                        if (ImGui::InputFloat("##mat_enom", &material.emod_nominal_kpa.items[i], 0.0f, 0.0f, "%.1f")) {
+                            if (i == 0) material.linear_E_nominal_kpa = material.emod_nominal_kpa.items[0];
+                            edited = true;
+                        }
                         ImGui::PopID();
 
                         ImGui::TableNextColumn();
-                        float e_sec_mpa = get_material_E(material.strain_table.items[i], material) / 1e6f;
-                        ImGui::Text("%.2f MPa", e_sec_mpa);
+                        ImGui::PushID((int)i + 40000);
+                        if (ImGui::InputFloat("##mat_ecold", &material.emod_cold_kpa.items[i], 0.0f, 0.0f, "%.1f")) {
+                            if (i == 0) material.linear_E_cold_kpa = material.emod_cold_kpa.items[0];
+                            edited = true;
+                        }
+                        ImGui::PopID();
+
+                        ImGui::TableNextColumn();
+                        ImGui::PushID((int)i + 50000);
+                        if (ImGui::InputFloat("##mat_ehot", &material.emod_hot_kpa.items[i], 0.0f, 0.0f, "%.1f")) {
+                            if (i == 0) material.linear_E_hot_kpa = material.emod_hot_kpa.items[0];
+                            edited = true;
+                        }
+                        ImGui::PopID();
+
+                        ImGui::TableNextColumn();
+                        float s_i = material.strain_table.items[i];
+                        float e_sec_mpa = get_material_E(s_i, material) / 1e6f;
+                        ImGui::Text("%.1f MPa (%.2f MPa)", e_sec_mpa, s_i * e_sec_mpa);
+                    }
+                    if (edited) {
+                        material.sync_active_table();
                     }
                     ImGui::EndTable();
                 }
@@ -964,7 +1252,7 @@ int main()
         // --- Modal / Floating Window 3: Bend Stiffener Size Optimizer ---
         if (show_optimizer_window)
         {
-            ImGui::SetNextWindowSize(ImVec2(600 * main_scale, 470 * main_scale), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(620 * main_scale, 490 * main_scale), ImGuiCond_FirstUseEver);
             ImGui::Begin("Bend Stiffener Size Optimizer", &show_optimizer_window);
 
             ImGui::TextWrapped("Automatically sizes Length (L) and Root Diameter (D_root) to minimize Polyurethane Volume & Mass while keeping Inner Diameter and Tip Diameter fixed by the flexible pipe.");
@@ -995,6 +1283,7 @@ int main()
             ImGui::PopItemWidth();
 
             ImGui::Checkbox("Use Far-Field Tension Elastica Loading when Tension > 0 kN", &opt_cfg.force_far_field_when_tension);
+            ImGui::Checkbox("Size Across Cold (4 C) / Nominal (20 C) / Warm (35 C) Temperature Envelope", &opt_cfg.include_temp_envelope);
             if (data1.count > 0) {
                 ImGui::Checkbox("Optimize Across All Pasted Angle/Tension Pairs Envelope", &opt_cfg.use_all_pairs);
             } else {
@@ -1016,21 +1305,7 @@ int main()
                                &x_coords, &curvature, &bend_radius, &last_solve_ms, true);
                 extract_results = solved;
                 if (solved) {
-                    float step = (DISCRETIZATION > 1) ? (bs.length / (float)(DISCRETIZATION - 1)) : 0.0f;
-                    for (int i = 0; i < DISCRETIZATION; i++) {
-                        float s_i = (float)i * step;
-                        length[i] = s_i;
-                        deflection_y[i] = results.items[i].items[0];
-                        float theta_i = results.items[i].items[1];
-                        moment_kNm[i] = results.items[i].items[2] / 1000.0f;
-                        float r_o = 0.5f * get_dia(bs, s_i);
-                        float nx = -std::sin(theta_i);
-                        float ny = std::cos(theta_i);
-                        def_top_x[i] = x_coords.items[i] + r_o * nx;
-                        def_top_y[i] = deflection_y[i] + r_o * ny;
-                        def_bot_x[i] = x_coords.items[i] - r_o * nx;
-                        def_bot_y[i] = deflection_y[i] - r_o * ny;
-                    }
+                    update_post_solve_data();
                 }
                 if (opt_cfg.use_all_pairs && data1.count > 0) {
                     solve_pairs(strain_maxs, pair_min_mbrs, pair_root_moments_kNm,
@@ -1057,6 +1332,79 @@ int main()
                 ImGui::Text("Peak Strain: %.2f%% (Utilization: %.1f%%) | Min MBR: %.2f m (Utilization: %.1f%%)",
                             last_opt_res.max_strain * 100.0f, last_opt_res.strain_utilization * 100.0f,
                             last_opt_res.min_mbr_m, last_opt_res.mbr_utilization * 100.0f);
+            }
+
+            ImGui::End();
+        }
+
+        // --- Modal / Floating Window 4: Temperature Envelope & Hang-Off Interface Reactions ---
+        if (show_temp_env_window)
+        {
+            ImGui::SetNextWindowSize(ImVec2(720 * main_scale, 380 * main_scale), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Temperature Envelope & Hang-Off Flange Reaction Loads", &show_temp_env_window);
+
+            if (!temp_env.evaluated) {
+                temp_env = evaluate_temperature_envelope(bs, material, target_angle_deg, target_tension_kN);
+            }
+
+            ImGui::SeparatorText("Governing Hang-Off Flange / Steel Collar Interface Reactions");
+            ImGui::Text("Governing Root Bending Moment (M0): %.2f kN.m  (governed by Cold 4 C Stiff PU)", temp_env.governing_root_moment_kNm);
+            ImGui::Text("Governing Root Shear Force (V0):    %.2f kN    | Root Axial Tension (N0): %.2f kN",
+                        temp_env.governing_root_shear_kN, temp_env.governing_root_axial_kN);
+            ImGui::Text("Governing Peak PU Strain:           %.2f%% (Allow %.1f%%) | Governing Min MBR: %.2f m (Allow %.2f m)",
+                        temp_env.governing_strain * 100.0f, bs.allowable_strain * 100.0f,
+                        temp_env.governing_min_mbr_m, bs.allowable_mbr_m);
+
+            ImGui::SeparatorText("Multi-Temperature Verification (Using Your Cold / Nominal / Hot E-Modulus Curves)");
+            if (ImGui::BeginTable("TempEnvTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Temperature Condition");
+                ImGui::TableSetupColumn("E0 [MPa]");
+                ImGui::TableSetupColumn("Max Strain [%]");
+                ImGui::TableSetupColumn("Min MBR [m]");
+                ImGui::TableSetupColumn("Root M0 [kN.m]");
+                ImGui::TableSetupColumn("Root V0 [kN]");
+                ImGui::TableSetupColumn("Status");
+                ImGui::TableHeadersRow();
+
+                for (int i = 0; i < 3; ++i) {
+                    const auto &r = temp_env.rows[i];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::Text("%s (%.1f C)", r.label, r.temp_c);
+                    ImGui::TableNextColumn(); ImGui::Text("%.1f", r.initial_E_mpa);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f%%", r.max_strain * 100.0f);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f m", r.min_mbr_m);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", r.root_moment_kNm);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", r.root_shear_kN);
+                    ImGui::TableNextColumn();
+                    if (r.pass) {
+                        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f), "PASS");
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.40f, 0.40f, 1.0f), "FAIL");
+                    }
+                }
+                ImGui::EndTable();
+            }
+
+            if (ImGui::Button("Re-Evaluate Envelope")) {
+                temp_env = evaluate_temperature_envelope(bs, material, target_angle_deg, target_tension_kN);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Copy Envelope Table (Excel)")) {
+                std::string tsv = "Condition\tTemp_C\tInitialE_MPa\tMaxStrain_pct\tMinMBR_m\tRootMoment_kNm\tRootShear_kN\tStatus\n";
+                char row[256];
+                for (int i = 0; i < 3; ++i) {
+                    const auto &r = temp_env.rows[i];
+                    snprintf(row, sizeof(row), "%s\t%.1f\t%.2f\t%.3f\t%.3f\t%.3f\t%.3f\t%s\n",
+                             r.label, r.temp_c, r.initial_E_mpa, r.max_strain * 100.0f,
+                             r.min_mbr_m, r.root_moment_kNm, r.root_shear_kN, r.pass ? "PASS" : "FAIL");
+                    tsv += row;
+                }
+                ImGui::SetClipboardText(tsv.c_str());
+                status_message = "Copied Temperature Envelope & Reaction table to clipboard.";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Close")) {
+                show_temp_env_window = false;
             }
 
             ImGui::End();
