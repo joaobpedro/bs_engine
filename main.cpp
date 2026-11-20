@@ -127,6 +127,16 @@ int ParseMaterialClipboard(Material &mat, const char* clipboard_data) {
 
     if (col_s.count < 2) return 0;
 
+    // Auto-detect percentage strain input (e.g. 0..20% pasted from Excel) and convert to fractional strain (0..0.20)
+    float max_s = col_s.max_val(0.0f);
+    float strain_scale = (max_s > 2.0f && max_s <= 100.0f) ? 0.01f : 1.0f;
+    for (size_t k = 0; k < col_s.count; ++k) {
+        col_s.items[k] = std::max(0.0f, col_s.items[k] * strain_scale);
+        col_n.items[k] = std::max(1.0f, col_n.items[k]);
+        if (k < col_c.count) col_c.items[k] = std::max(1.0f, col_c.items[k]);
+        if (k < col_h.count) col_h.items[k] = std::max(1.0f, col_h.items[k]);
+    }
+
     if (max_cols_found >= 4 && col_c.count == col_s.count && col_h.count == col_s.count) {
         mat.strain_table = col_s;
         mat.emod_nominal_kpa = col_n;
@@ -244,6 +254,7 @@ bool solve(float target_angle,
     return true;
 }
 
+// Fast zero-allocation batch evaluation of (Angle, Tension) pairs without overwriting the active single-solve buffers
 void solve_pairs(Vec1<float> &strain_maxs,
                  Vec1<float> &pair_min_mbrs,
                  Vec1<float> &pair_root_moments_kNm,
@@ -255,22 +266,22 @@ void solve_pairs(Vec1<float> &strain_maxs,
                  const Material &mat = Material(),
                  double* out_total_ms = nullptr)
 {
+    (void)results;
+    (void)strain;
     auto start = std::chrono::high_resolution_clock::now();
     strain_maxs.clear();
     pair_min_mbrs.clear();
     pair_root_moments_kNm.clear();
 
-    Vec1<float> temp_x(DISCRETIZATION);
-    Vec1<float> temp_curv(DISCRETIZATION);
-    Vec1<float> temp_mbr(DISCRETIZATION);
-
+    const size_t steps = (DISCRETIZATION > 1) ? (DISCRETIZATION - 1) : 1;
     for (size_t i = 0; i < angles_deg.count; ++i) {
         float angle_rad = angles_deg.items[i] * (3.14159265358979323846f / 180.0f);
-        float tension_kN = (i < tensions_kN.count) ? tensions_kN.items[i] : 0.0f;
-        solve(angle_rad, bs, results, strain, mat, tension_kN, &temp_x, &temp_curv, &temp_mbr, nullptr, false);
-        strain_maxs.append(strain.max_pos());
-        pair_min_mbrs.append(temp_mbr.min_pos(1000.0f));
-        float m0_kNm = (results.count > 0) ? (std::fabs(results.items[0].items[2]) / 1000.0f) : 0.0f;
+        float tension_N = ((i < tensions_kN.count) ? tensions_kN.items[i] : 0.0f) * 1000.0f;
+        float max_eps = 0.0f, avg_eps = 0.0f, tip_eps = 0.0f, root_eps = 0.0f, min_mbr = 1000.0f, m0_kNm = 0.0f;
+        evaluate_candidate_single(bs, mat, steps, angle_rad, tension_N,
+                                  max_eps, avg_eps, tip_eps, root_eps, min_mbr, m0_kNm);
+        strain_maxs.append(max_eps);
+        pair_min_mbrs.append(min_mbr);
         pair_root_moments_kNm.append(m0_kNm);
     }
 
@@ -416,6 +427,7 @@ int main()
 
     bool solved = false;
     bool extract_results = true;
+    bool reset_plot_limits = true;
     bool show_input_window = false;
     bool show_material_window = false;
     bool show_optimizer_window = false;
@@ -529,11 +541,11 @@ int main()
 
         ImGui::Begin("Bend Stiffener Calculator", nullptr, main_win_flags);
 
-        // --- Section 1: Geometry, Pipe & Design Criteria Inputs ---
-        ImGui::SeparatorText("Bend Stiffener Geometry, Internal Pipe & Design Limits");
+        // --- Section 1: Geometry, Pipe, Root Insert & Design Criteria Inputs ---
+        ImGui::SeparatorText("Bend Stiffener Geometry, Steel Root Insert, Annular Gap & Design Limits");
         float col2_x = 420.0f * main_scale;
         float col3_x = 840.0f * main_scale;
-        ImGui::PushItemWidth(175.0f * main_scale);
+        ImGui::PushItemWidth(165.0f * main_scale);
 
         ImGui::InputFloat("Total Length L [m]", &bs.length, 0.1f, 0.5f, "%.3f");
         ImGui::SameLine(col2_x);
@@ -551,14 +563,22 @@ int main()
 
         ImGui::InputFloat("Inner Bore Dia [m]", &bs.inner_dia, 0.01f, 0.05f, "%.3f");
         ImGui::SameLine(col2_x);
-        ImGui::InputFloat("Target Angle [deg]", &target_angle_deg, 1.0f, 5.0f, "%.2f");
+        ImGui::InputFloat("Pipe Outer Dia [m]", &bs.pipe_od, 0.005f, 0.02f, "%.3f");
         ImGui::SameLine(col3_x);
         ImGui::InputFloat("Allowable Pipe MBR [m]", &bs.allowable_mbr_m, 0.1f, 0.5f, "%.2f");
 
+        ImGui::InputFloat("Steel Insert L_ins [m]", &bs.insert_length, 0.05f, 0.1f, "%.3f");
+        ImGui::SameLine(col2_x);
+        ImGui::InputFloat("Steel Insert Dia [m]", &bs.insert_dia, 0.01f, 0.05f, "%.3f");
+        ImGui::SameLine(col3_x);
+        ImGui::InputFloat("Allow Bond Stress [MPa]", &bs.allowable_bond_stress_mpa, 0.1f, 0.5f, "%.2f");
+
+        ImGui::InputFloat("Target Angle [deg]", &target_angle_deg, 1.0f, 5.0f, "%.2f");
+        ImGui::SameLine(col2_x);
         ImGui::InputFloat("Target Tension [kN]", &target_tension_kN, 5.0f, 25.0f, "%.2f");
         ImGui::PopItemWidth();
 
-        ImGui::SameLine(col2_x);
+        ImGui::SameLine(col3_x);
         ImGui::Checkbox("Arc-Length Elastica (s)", &bs.use_arc_length);
         ImGui::SameLine();
         ImGui::Checkbox("Far-Field Tension BC (OrcaFlex)", &bs.use_far_field_bc);
@@ -623,13 +643,24 @@ int main()
             if (load_project_file(project_filename, bs, material, opt_cfg, target_angle_deg, target_tension_kN, data1, data2)) {
                 allowable_strain_pct = bs.allowable_strain * 100.0f;
                 data_pasted = (data1.count > 0);
+                target_angle = (3.14159265358979323846f / 180.0f) * target_angle_deg;
+                solved = solve(target_angle, bs, results, strain, material, target_tension_kN,
+                               &x_coords, &curvature, &bend_radius, &last_solve_ms, false);
+                extract_results = solved;
+                if (solved) {
+                    update_post_solve_data();
+                    reset_plot_limits = true;
+                }
                 status_message = std::string("Loaded project from '") + project_filename + "'.";
             } else {
                 status_message = std::string("No existing '") + project_filename + "' found to load.";
             }
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("| PU Mass: %.1f kg (%.3f m3)", get_pu_mass_kg(bs), get_pu_volume_m3(bs));
+        float live_bond_mpa = (solved && results.count > 0)
+            ? get_insert_bond_stress_mpa(bs, results.items[0].items[2], results.items[0].items[3]) : 0.0f;
+        ImGui::TextDisabled("| PU Mass: %.1f kg | Gap: %.1f mm (%.2f deg) | Bond: %.2f MPa",
+                            get_pu_mass_kg(bs), get_annular_gap_mm(bs), get_gap_contact_angle_deg(bs), live_bond_mpa);
 
         // --- Section 2: Solver Controls & Export ---
         ImGui::SeparatorText("Solver, Verification & Export Controls");
@@ -638,7 +669,7 @@ int main()
         if (ImGui::Button("Calculate Strain & Curvature"))
         {
             if (!is_valid_geometry(bs)) {
-                status_message = "Error: Invalid geometry! Ensure 0 <= L_cyl < L and Root/Tip Dia > Inner Dia >= 0.";
+                status_message = "Error: Invalid geometry! Ensure 0 <= L_cyl < L and Root Dia >= Tip Dia > Inner Dia >= 0.";
                 solved = false;
             } else if (!bs.use_arc_length && std::fabs(target_angle_deg) >= 89.5f) {
                 status_message = "Error: Cartesian X-mode requires Target Angle in (-89, +89) deg. Enable Arc-Length Elastica (s) for large angles.";
@@ -652,21 +683,22 @@ int main()
                 extract_results = solved;
                 if (solved) {
                     update_post_solve_data();
+                    reset_plot_limits = true;
                     float max_eps = strain.max_pos();
                     float min_mbr = bend_radius.min_pos(1000.0f);
+                    float bond_mpa = get_insert_bond_stress_mpa(bs, results.items[0].items[2], results.items[0].items[3]);
                     bool pass_strain = (max_eps <= bs.allowable_strain);
                     bool pass_mbr = (min_mbr >= bs.allowable_mbr_m);
+                    bool pass_bond = (bs.insert_length <= 1e-4f) || (bond_mpa <= bs.allowable_bond_stress_mpa);
                     float v0_kN = std::fabs(results.items[0].items[3]) / 1000.0f;
-                    char buf[340];
+                    char buf[380];
                     snprintf(buf, sizeof(buf),
-                             "[%s] Solved in %.3f ms | Max Strain: %.2f%% (Allow %.1f%%) | Min MBR: %.2f m (Allow %.2f m) | Root M0: %.2f kN.m, V0: %.1f kN | Tip (X,Y): (%.2f, %.2f) m",
-                             (pass_strain && pass_mbr) ? "PASS" : "FAIL",
+                             "[%s] Solved in %.3f ms | Max Strain: %.2f%% (Allow %.1f%%) | Min MBR: %.2f m (Allow %.2f m) | Root M0: %.2f kN.m, V0: %.1f kN | Bond: %.2f MPa",
+                             (pass_strain && pass_mbr && pass_bond) ? "PASS" : "FAIL",
                              last_solve_ms,
                              max_eps * 100.0f, bs.allowable_strain * 100.0f,
                              min_mbr, bs.allowable_mbr_m,
-                             results.items[0].items[2] / 1000.0f, v0_kN,
-                             x_coords.items[DISCRETIZATION - 1],
-                             results.items[DISCRETIZATION - 1].items[0]);
+                             results.items[0].items[2] / 1000.0f, v0_kN, bond_mpa);
                     status_message = buf;
                 }
             }
@@ -691,6 +723,7 @@ int main()
             extract_results = solved;
             if (solved) {
                 update_post_solve_data();
+                reset_plot_limits = true;
             }
             if (opt_cfg.use_all_pairs && data1.count > 0) {
                 solve_pairs(strain_maxs, pair_min_mbrs, pair_root_moments_kNm,
@@ -762,6 +795,31 @@ int main()
                     status_message = "Exported spatial profile to 'bs_profile_results.csv'.";
                 }
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Generate HTML Report")) {
+                float theta_arr[DISCRETIZATION];
+                float mom_Nm_arr[DISCRETIZATION];
+                float shear_N_arr[DISCRETIZATION];
+                for (int i = 0; i < DISCRETIZATION; ++i) {
+                    theta_arr[i] = results.items[i].items[1];
+                    mom_Nm_arr[i] = results.items[i].items[2];
+                    shear_N_arr[i] = results.items[i].items[3];
+                }
+                float m0_kNm = results.items[0].items[2] / 1000.0f;
+                float v0_kN = results.items[0].items[3] / 1000.0f;
+                float n0_kN = std::fabs(target_tension_kN) * std::max(0.0f, std::cos(target_angle));
+                if (generate_html_report("bs_engineering_report.html", bs, material,
+                                         target_angle_deg, target_tension_kN,
+                                         m0_kNm, v0_kN, n0_kN,
+                                         length, x_coords.items, deflection_y,
+                                         theta_arr, mom_Nm_arr, shear_N_arr,
+                                         strain.items, curvature.items, bend_radius.items,
+                                         DISCRETIZATION, tail_x, tail_y, TAIL_NODES)) {
+                    status_message = "Generated HTML Engineering Calculation Report: 'bs_engineering_report.html'.";
+                } else {
+                    status_message = "Error: Failed to write 'bs_engineering_report.html'.";
+                }
+            }
         }
 
         ImGui::Checkbox("Geometry & Deformed Shape", &plot_bs);
@@ -784,7 +842,7 @@ int main()
         float plot_height = std::max(175.0f, 0.25f * io.DisplaySize.y);
 
         // Undeformed polygon with cylindrical root L_cyl + conical taper
-        float c_len = std::clamp(bs.root_cyl_length, 0.0f, bs.length);
+        float c_len = std::clamp(bs.root_cyl_length, 0.0f, std::max(0.0f, bs.length));
         float x_data[7] = { 0.0f, 0.0f, c_len, bs.length, bs.length, c_len, 0.0f };
         float y_data[7] = {
             -bs.root_dia / 2.0f, bs.root_dia / 2.0f, bs.root_dia / 2.0f,
@@ -796,11 +854,13 @@ int main()
 
         if (plot_bs)
         {
-            if (ImPlot::BeginPlot("Bend Stiffener Geometry & 2D Deformed Shape (with Exiting Bare Pipe Tail)", ImVec2(-1, plot_height))) {
+            if (ImPlot::BeginPlot("Bend Stiffener Geometry & 2D Deformed Shape (with Steel Insert & Exiting Pipe Tail)", ImVec2(-1, plot_height))) {
                 ImPlot::SetupAxes("Axial Position X [m]", "Transverse Position Y [m]");
                 float max_x_extent = solved ? std::max(bs.length * 1.15f, tail_x[TAIL_NODES - 1] * 1.05f) : (bs.length * 1.10f);
                 float max_y_extent = std::max(0.65f * bs.root_dia, solved ? (std::fabs(tail_y[TAIL_NODES - 1]) + bs.root_dia) : (0.65f * bs.root_dia));
-                ImPlot::SetupAxesLimits(-0.05 * bs.length, max_x_extent, -max_y_extent, max_y_extent, ImGuiCond_Once);
+                ImPlot::SetupAxesLimits(-0.05 * bs.length, max_x_extent, -max_y_extent, max_y_extent,
+                                        reset_plot_limits ? ImGuiCond_Always : ImGuiCond_Once);
+                reset_plot_limits = false;
                 ImPlotSpec spec;
                 spec.LineWeight = 2.0f * main_scale;
                 ImPlot::PlotLine("Undeformed Cone", x_data, y_data, 7, spec);
@@ -808,6 +868,27 @@ int main()
                 inner_spec.LineWeight = 1.2f * main_scale;
                 ImPlot::PlotLine("Inner Bore (+)", inner_x, inner_y_top, 2, inner_spec);
                 ImPlot::PlotLine("Inner Bore (-)", inner_x, inner_y_bot, 2, inner_spec);
+
+                if (bs.pipe_od > 1e-4f && bs.pipe_od < bs.inner_dia) {
+                    float pipe_y_top[2] = { bs.pipe_od / 2.0f, bs.pipe_od / 2.0f };
+                    float pipe_y_bot[2] = { -bs.pipe_od / 2.0f, -bs.pipe_od / 2.0f };
+                    ImPlot::PlotLine("Pipe OD (+)", inner_x, pipe_y_top, 2, inner_spec);
+                    ImPlot::PlotLine("Pipe OD (-)", inner_x, pipe_y_bot, 2, inner_spec);
+                }
+
+                if (bs.insert_length > 1e-4f) {
+                    float l_ins = std::min(bs.insert_length, bs.length);
+                    float hi_ins = std::max(bs.inner_dia, bs.root_dia - 0.02f);
+                    float r_ins = 0.5f * std::clamp(bs.insert_dia, bs.inner_dia, hi_ins);
+                    float r_in = 0.5f * bs.inner_dia;
+                    float ins_x[5] = { 0.0f, l_ins, l_ins, 0.0f, 0.0f };
+                    float ins_y_top[5] = { r_in, r_in, r_ins, r_ins, r_in };
+                    float ins_y_bot[5] = { -r_in, -r_in, -r_ins, -r_ins, -r_in };
+                    ImPlotSpec ins_spec;
+                    ins_spec.LineWeight = 1.8f * main_scale;
+                    ImPlot::PlotLine("Steel Root Insert (+)", ins_x, ins_y_top, 5, ins_spec);
+                    ImPlot::PlotLine("Steel Root Insert (-)", ins_x, ins_y_bot, 5, ins_spec);
+                }
 
                 if (solved && plot_deformed) {
                     ImPlotSpec def_center_spec;
@@ -893,7 +974,10 @@ int main()
                 ImPlot::PlotScatter("Max Strain per Pair", data1.items, strain_maxs.items, (int)plot_count, spec_p);
 
                 if (data1.count > 0) {
-                    float lim_x[2] = { 0.0f, data1.max_pos() * 1.05f };
+                    float min_x = std::min(0.0f, data1.min_val(0.0f) * 1.05f);
+                    float max_x = std::max(0.0f, data1.max_val(0.0f) * 1.05f);
+                    if (std::fabs(max_x - min_x) < 1e-3f) max_x = min_x + 1.0f;
+                    float lim_x[2] = { min_x, max_x };
                     float lim_y[2] = { bs.allowable_strain, bs.allowable_strain };
                     ImPlotSpec lim_spec;
                     lim_spec.LineWeight = 1.8f * main_scale;
@@ -922,7 +1006,7 @@ int main()
                 }
                 data_pasted = (data1.count > 0);
                 if (data_pasted) {
-                    target_angle_deg = data1.max_pos();
+                    target_angle_deg = data1.max_abs_signed(target_angle_deg);
                 }
             }
 
@@ -1252,7 +1336,7 @@ int main()
         // --- Modal / Floating Window 3: Bend Stiffener Size Optimizer ---
         if (show_optimizer_window)
         {
-            ImGui::SetNextWindowSize(ImVec2(620 * main_scale, 490 * main_scale), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(720 * main_scale, 690 * main_scale), ImGuiCond_FirstUseEver);
             ImGui::Begin("Bend Stiffener Size Optimizer", &show_optimizer_window);
 
             ImGui::TextWrapped("Automatically sizes Length (L) and Root Diameter (D_root) to minimize Polyurethane Volume & Mass while keeping Inner Diameter and Tip Diameter fixed by the flexible pipe.");
@@ -1318,7 +1402,7 @@ int main()
             }
 
             if (last_opt_res.converged) {
-                ImGui::SeparatorText("Latest Optimization Result");
+                ImGui::SeparatorText("Latest Optimization Result & 2D Design Space (L vs D_root)");
                 ImGui::TextColored(
                     last_opt_res.feasible ? ImVec4(0.35f, 0.95f, 0.55f, 1.0f) : ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
                     "Status: %s (%d candidate evaluations in %.2f ms)",
@@ -1327,11 +1411,74 @@ int main()
                 ImGui::Text("Optimal Dimensions: L = %.3f m (L_cyl = %.3f m) | D_root = %.3f m | D_tip = %.3f m",
                             last_opt_res.best_bs.length, last_opt_res.best_bs.root_cyl_length,
                             last_opt_res.best_bs.root_dia, last_opt_res.best_bs.tip_dia);
-                ImGui::Text("Polyurethane Volume: %.4f m3 | Estimated PU Mass: %.1f kg",
-                            last_opt_res.volume_m3, last_opt_res.mass_kg);
+                ImGui::Text("Polyurethane Volume: %.4f m3 | Estimated PU Mass: %.1f kg | Bond Stress: %.2f MPa (%.1f%%)",
+                            last_opt_res.volume_m3, last_opt_res.mass_kg,
+                            last_opt_res.max_bond_stress_mpa, last_opt_res.bond_utilization * 100.0f);
                 ImGui::Text("Peak Strain: %.2f%% (Utilization: %.1f%%) | Min MBR: %.2f m (Utilization: %.1f%%)",
                             last_opt_res.max_strain * 100.0f, last_opt_res.strain_utilization * 100.0f,
                             last_opt_res.min_mbr_m, last_opt_res.mbr_utilization * 100.0f);
+
+                // 2D Optimization Design-Space Feasibility Map (L vs D_root)
+                if (last_opt_res.grid_nL > 1 && last_opt_res.grid_nDr > 1) {
+                    float feas_L[OPT_GRID_N * OPT_GRID_N];
+                    float feas_Dr[OPT_GRID_N * OPT_GRID_N];
+                    int n_feas = 0;
+                    float infeas_L[OPT_GRID_N * OPT_GRID_N];
+                    float infeas_Dr[OPT_GRID_N * OPT_GRID_N];
+                    int n_infeas = 0;
+
+                    for (int iL = 0; iL < last_opt_res.grid_nL; ++iL) {
+                        for (int iDr = 0; iDr < last_opt_res.grid_nDr; ++iDr) {
+                            if (last_opt_res.grid_feasible[iL][iDr]) {
+                                feas_L[n_feas] = last_opt_res.grid_L[iL];
+                                feas_Dr[n_feas] = last_opt_res.grid_Dr[iDr];
+                                n_feas++;
+                            } else {
+                                infeas_L[n_infeas] = last_opt_res.grid_L[iL];
+                                infeas_Dr[n_infeas] = last_opt_res.grid_Dr[iDr];
+                                n_infeas++;
+                            }
+                        }
+                    }
+
+                    if (ImPlot::BeginPlot("2D Design-Space Feasibility Map (Length L vs. Root Diameter D_root)", ImVec2(-1, 215 * main_scale))) {
+                        ImPlot::SetupAxes("Length L [m]", "Root Diameter D_root [m]");
+                        if (n_infeas > 0) {
+                            ImPlotSpec sp_inf;
+                            sp_inf.Marker = ImPlotMarker_Cross;
+                            sp_inf.MarkerSize = 4.0f * main_scale;
+                            sp_inf.LineWeight = 1.5f * main_scale;
+                            ImPlot::PlotScatter("Infeasible Grid", infeas_L, infeas_Dr, n_infeas, sp_inf);
+                        }
+                        if (n_feas > 0) {
+                            ImPlotSpec sp_f;
+                            sp_f.Marker = ImPlotMarker_Circle;
+                            sp_f.MarkerSize = 4.2f * main_scale;
+                            sp_f.LineWeight = 1.5f * main_scale;
+                            ImPlot::PlotScatter("Feasible Grid", feas_L, feas_Dr, n_feas, sp_f);
+                        }
+                        if (last_opt_res.strain_bound_count > 1) {
+                            ImPlotSpec sp_sb;
+                            sp_sb.LineWeight = 2.0f * main_scale;
+                            ImPlot::PlotLine("Strain Limit Boundary", last_opt_res.strain_bound_L, last_opt_res.strain_bound_Dr,
+                                             last_opt_res.strain_bound_count, sp_sb);
+                        }
+                        if (last_opt_res.mbr_bound_count > 1) {
+                            ImPlotSpec sp_mb;
+                            sp_mb.LineWeight = 2.0f * main_scale;
+                            ImPlot::PlotLine("Pipe MBR Limit Boundary", last_opt_res.mbr_bound_L, last_opt_res.mbr_bound_Dr,
+                                             last_opt_res.mbr_bound_count, sp_mb);
+                        }
+                        float opt_L = last_opt_res.best_bs.length;
+                        float opt_Dr = last_opt_res.best_bs.root_dia;
+                        ImPlotSpec sp_opt;
+                        sp_opt.Marker = ImPlotMarker_Diamond;
+                        sp_opt.MarkerSize = 7.0f * main_scale;
+                        sp_opt.LineWeight = 2.4f * main_scale;
+                        ImPlot::PlotScatter("Optimal Design (L*, D_root*)", &opt_L, &opt_Dr, 1, sp_opt);
+                        ImPlot::EndPlot();
+                    }
+                }
             }
 
             ImGui::End();

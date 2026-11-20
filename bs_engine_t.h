@@ -22,15 +22,83 @@ struct BendStiffner {
     float allowable_mbr_m = 2.5f;   // Min allowable pipe bend radius MBR [m]
     bool use_arc_length = true;     // Integrate along physical arc length s in [0, L]
     bool use_far_field_bc = false;  // false: Prescribed Tip Angle; true: Far-Field Tension & Angle (OrcaFlex BC)
+    float pipe_od = 0.110f;                 // Flexible pipe outer diameter D_pipe [m] (<= inner_dia)
+    float insert_length = 0.0f;             // Embedded steel root insert sleeve length L_insert [m]
+    float insert_dia = 0.220f;              // Embedded steel root insert outer diameter D_insert [m]
+    float insert_EI_kNm2 = 450.0f;          // Steel root insert base flexural stiffness [kN.m^2]
+    float allowable_bond_stress_mpa = 1.50f; // Allowable PU-to-steel insert interface bond stress [MPa]
 };
 
 inline bool is_valid_geometry(const BendStiffner &bs) {
-    return (bs.length > 1e-4f) &&
+    return std::isfinite(bs.length) &&
+           std::isfinite(bs.root_dia) &&
+           std::isfinite(bs.tip_dia) &&
+           std::isfinite(bs.inner_dia) &&
+           (bs.length > 1e-4f) &&
            (bs.inner_dia >= 0.0f) &&
            (bs.root_dia > bs.inner_dia + 1e-5f) &&
            (bs.tip_dia > bs.inner_dia + 1e-5f) &&
+           (bs.root_dia >= bs.tip_dia - 1e-5f) &&
            (bs.root_cyl_length >= 0.0f) &&
-           (bs.root_cyl_length < bs.length);
+           (bs.root_cyl_length < bs.length) &&
+           (bs.allowable_strain > 1e-5f) &&
+           (bs.allowable_mbr_m > 1e-4f);
+}
+
+// Effective inner diameter of the polyurethane sleeve at station s (accounting for embedded steel root insert)
+inline float get_pu_inner_dia(const BendStiffner &bs, float s) {
+    if (bs.insert_length > 1e-4f && s >= 0.0f && s < bs.insert_length) {
+        float hi_ins = std::max(bs.inner_dia, bs.root_dia - 0.02f);
+        float d_ins = std::clamp(bs.insert_dia, bs.inner_dia, hi_ins);
+        // Smooth transition over the last 15% of insert length
+        float t = s / bs.insert_length;
+        if (t > 0.85f) {
+            float alpha = (t - 0.85f) / 0.15f;
+            return d_ins + (bs.inner_dia - d_ins) * alpha;
+        }
+        return d_ins;
+    }
+    return bs.inner_dia;
+}
+
+// Effective flexural stiffness [N.m^2] of the embedded steel root insert at station s
+inline float get_insert_EI_Pa(const BendStiffner &bs, float s) {
+    if (bs.insert_length <= 1e-4f || s < 0.0f || s >= bs.insert_length) return 0.0f;
+    float t = std::clamp(s / bs.insert_length, 0.0f, 1.0f);
+    // Slotted/fingered steel insert cone tapers its flexural contribution smoothly to 0 at s = L_insert
+    return std::max(0.0f, bs.insert_EI_kNm2) * 1000.0f * (1.0f - t) * (1.0f - t);
+}
+
+// Calculates peak PU-to-Steel interface bond shear stress [MPa] along the embedded steel root insert
+inline float get_insert_bond_stress_mpa(const BendStiffner &bs, float root_moment_Nm, float root_shear_N) {
+    if (bs.insert_length <= 1e-4f) return 0.0f;
+    constexpr float pi = 3.14159265358979323846f;
+    float lo_ins = bs.inner_dia + 0.01f;
+    float hi_ins = std::max(lo_ins, bs.root_dia - 0.02f);
+    float d_ins = std::clamp(bs.insert_dia, lo_ins, hi_ins);
+    float L_ins = bs.insert_length;
+    float area_bond = pi * d_ins * L_ins;
+    float z_bond = (pi / 4.0f) * d_ins * d_ins * L_ins;
+    float tau_pa = (std::fabs(root_moment_Nm) / std::max(1e-6f, z_bond)) +
+                   (std::fabs(root_shear_N) / std::max(1e-6f, area_bond));
+    return tau_pa / 1e6f;
+}
+
+// Calculates annular clearance gap [mm], effective contact span [m], and free-span contact angle [deg]
+inline float get_annular_gap_mm(const BendStiffner &bs) {
+    if (bs.pipe_od <= 0.0f || bs.inner_dia <= bs.pipe_od) return 0.0f;
+    return (bs.inner_dia - bs.pipe_od) * 1000.0f;
+}
+
+inline float get_gap_contact_span_m(const BendStiffner &bs) {
+    return std::max(0.25f, (bs.root_cyl_length > 0.05f) ? bs.root_cyl_length : (0.15f * bs.length));
+}
+
+inline float get_gap_contact_angle_deg(const BendStiffner &bs) {
+    if (bs.pipe_od <= 0.0f || bs.inner_dia <= bs.pipe_od) return 0.0f;
+    float gap_m = bs.inner_dia - bs.pipe_od;
+    float L_span = get_gap_contact_span_m(bs);
+    return std::atan(gap_m / L_span) * (180.0f / 3.14159265358979323846f);
 }
 
 struct Vec2 {
@@ -109,13 +177,13 @@ struct Vec1 {
     }
 
     T& operator[](size_t index) {
-        assert(index < capacity);
-        return items[index < capacity ? index : (capacity - 1)];
+        assert(index < capacity && capacity > 0);
+        return items[(index < capacity) ? index : (capacity > 0 ? capacity - 1 : 0)];
     }
 
     const T& operator[](size_t index) const {
-        assert(index < capacity);
-        return items[index < capacity ? index : (capacity - 1)];
+        assert(index < capacity && capacity > 0);
+        return items[(index < capacity) ? index : (capacity > 0 ? capacity - 1 : 0)];
     }
 
     void reserve(size_t new_capacity) {
@@ -140,8 +208,8 @@ struct Vec1 {
 
     void clear() {
         if constexpr (std::is_arithmetic<T>::value) {
-            if (items && capacity > 0) {
-                std::memset(items, 0, capacity * sizeof(T));
+            if (items && count > 0) {
+                std::memset(items, 0, count * sizeof(T));
             }
         } else {
             for (size_t i = 0; i < count; ++i) {
@@ -163,6 +231,48 @@ struct Vec1 {
             return max_element;
         } else {
             return 0.0f;
+        }
+    }
+
+    float max_abs_signed(float fallback = 0.0f) const {
+        if constexpr (std::is_arithmetic<T>::value) {
+            if (count == 0) return fallback;
+            float best = (float)items[0];
+            for (size_t i = 1; i < count; ++i) {
+                float v = (float)items[i];
+                if (std::fabs(v) > std::fabs(best)) best = v;
+            }
+            return best;
+        } else {
+            return fallback;
+        }
+    }
+
+    float min_val(float fallback = 0.0f) const {
+        if constexpr (std::is_arithmetic<T>::value) {
+            if (count == 0) return fallback;
+            float m = (float)items[0];
+            for (size_t i = 1; i < count; ++i) {
+                float v = (float)items[i];
+                if (v < m) m = v;
+            }
+            return m;
+        } else {
+            return fallback;
+        }
+    }
+
+    float max_val(float fallback = 0.0f) const {
+        if constexpr (std::is_arithmetic<T>::value) {
+            if (count == 0) return fallback;
+            float m = (float)items[0];
+            for (size_t i = 1; i < count; ++i) {
+                float v = (float)items[i];
+                if (v > m) m = v;
+            }
+            return m;
+        } else {
+            return fallback;
         }
     }
 
@@ -222,7 +332,10 @@ struct Material {
     Vec1<float> emod_nominal_kpa;
     Vec1<float> emod_cold_kpa;
     Vec1<float> emod_hot_kpa;
-    Vec1<float> emod_table_kpa; // Active table E [kPa]
+    Vec1<float> emod_table_kpa;          // Active table E [kPa]
+    Vec1<float> stress_table_kpa;        // Precomputed cumulative stress integral S(strain_table[i]) [kPa]
+    bool is_uniform_grid = false;        // O(1) direct index lookup when strain_table is uniformly spaced
+    float inv_grid_step = 100.0f;
 
     Material()
         : is_nonlinear(true),
@@ -240,7 +353,8 @@ struct Material {
           emod_nominal_kpa(DEFAULT_MATERIAL_DATA_SIZE),
           emod_cold_kpa(DEFAULT_MATERIAL_DATA_SIZE),
           emod_hot_kpa(DEFAULT_MATERIAL_DATA_SIZE),
-          emod_table_kpa(DEFAULT_MATERIAL_DATA_SIZE) {
+          emod_table_kpa(DEFAULT_MATERIAL_DATA_SIZE),
+          stress_table_kpa(DEFAULT_MATERIAL_DATA_SIZE) {
         reset_to_default();
     }
 
@@ -254,6 +368,46 @@ struct Material {
         } else {
             emod_table_kpa = emod_nominal_kpa;
             linear_E_kpa = linear_E_nominal_kpa;
+        }
+
+        // Precompute cumulative trapezoidal stress table S[i] [kPa] and check uniform grid spacing for O(1) lookup
+        size_t n = std::min(strain_table.count, emod_table_kpa.count);
+        stress_table_kpa.clear();
+        if (stress_table_kpa.capacity < n) {
+            stress_table_kpa.reserve(n);
+        }
+        is_uniform_grid = false;
+        inv_grid_step = 100.0f;
+
+        if (n >= 2) {
+            float dx_avg = (strain_table.items[n - 1] - strain_table.items[0]) / (float)(n - 1);
+            if (dx_avg > 1e-6f) {
+                bool uniform = true;
+                for (size_t i = 0; i < n - 1; ++i) {
+                    float dxi = strain_table.items[i + 1] - strain_table.items[i];
+                    if (std::fabs(dxi - dx_avg) > 1e-5f) {
+                        uniform = false;
+                        break;
+                    }
+                }
+                if (uniform) {
+                    is_uniform_grid = true;
+                    inv_grid_step = 1.0f / dx_avg;
+                }
+            }
+
+            double acc = 0.0;
+            if (strain_table.items[0] > 0.0f) {
+                acc = (double)strain_table.items[0] * (double)std::max(1.0f, emod_table_kpa.items[0]);
+            }
+            stress_table_kpa.append((float)acc);
+            for (size_t i = 0; i < n - 1; ++i) {
+                double dx = std::max(0.0, (double)strain_table.items[i + 1] - (double)strain_table.items[i]);
+                double y0 = std::max(1.0, (double)emod_table_kpa.items[i]);
+                double y1 = std::max(1.0, (double)emod_table_kpa.items[i + 1]);
+                acc += 0.5 * (y0 + y1) * dx;
+                stress_table_kpa.append((float)acc);
+            }
         }
     }
 
@@ -316,18 +470,14 @@ inline float get_non_linear_E(float strain) {
         return DEFAULT_EMOD_VECTOR_KPA[DEFAULT_MATERIAL_DATA_SIZE - 1] * 1000.0f;
     }
 
-    for (int i = 0; i < DEFAULT_MATERIAL_DATA_SIZE - 1; ++i) {
-        float x0 = DEFAULT_STRAIN_VECTOR[i];
-        float x1 = DEFAULT_STRAIN_VECTOR[i + 1];
-        if (s >= x0 && s <= x1) {
-            float y0 = DEFAULT_EMOD_VECTOR_KPA[i];
-            float y1 = DEFAULT_EMOD_VECTOR_KPA[i + 1];
-            float dx = x1 - x0;
-            float result = (dx > 1e-12f) ? (y0 + (s - x0) * (y1 - y0) / dx) : y0;
-            return result * 1000.0f;
-        }
-    }
-    return DEFAULT_EMOD_VECTOR_KPA[DEFAULT_MATERIAL_DATA_SIZE - 1] * 1000.0f;
+    int idx = std::clamp((int)(s * 100.0f), 0, DEFAULT_MATERIAL_DATA_SIZE - 2);
+    float x0 = DEFAULT_STRAIN_VECTOR[idx];
+    float x1 = DEFAULT_STRAIN_VECTOR[idx + 1];
+    float y0 = DEFAULT_EMOD_VECTOR_KPA[idx];
+    float y1 = DEFAULT_EMOD_VECTOR_KPA[idx + 1];
+    float dx = x1 - x0;
+    float result = (dx > 1e-12f) ? (y0 + (s - x0) * (y1 - y0) / dx) : y0;
+    return result * 1000.0f;
 }
 
 // Piecewise linear interpolation of custom non-linear E table (returns Pa)
@@ -338,28 +488,24 @@ inline float get_non_linear_E_custom(float strain, const Vec1<float> &strain_inp
     if (n == 1) return E_mod_input_vector.items[0] * 1000.0f;
 
     float s = std::fabs(strain);
-    if (s <= strain_input_vector.items[0]) {
-        return E_mod_input_vector.items[0] * 1000.0f;
-    }
-    if (s >= strain_input_vector.items[n - 1]) {
-        return E_mod_input_vector.items[n - 1] * 1000.0f;
-    }
+    const float* xs = strain_input_vector.items;
+    const float* ys = E_mod_input_vector.items;
+    if (s <= xs[0]) return ys[0] * 1000.0f;
+    if (s >= xs[n - 1]) return ys[n - 1] * 1000.0f;
 
-    for (size_t i = 0; i < n - 1; ++i) {
-        float x0 = strain_input_vector.items[i];
-        float x1 = strain_input_vector.items[i + 1];
-        if (s >= x0 && s <= x1) {
-            float y0 = E_mod_input_vector.items[i];
-            float y1 = E_mod_input_vector.items[i + 1];
-            float dx = x1 - x0;
-            float result = (dx > 1e-12f) ? (y0 + (s - x0) * (y1 - y0) / dx) : y0;
-            return result * 1000.0f;
-        }
-    }
-    return E_mod_input_vector.items[n - 1] * 1000.0f;
+    const float* it = std::upper_bound(xs, xs + n, s);
+    size_t i = (it > xs) ? (size_t)(it - xs - 1) : 0;
+    if (i >= n - 1) i = n - 2;
+    float x0 = xs[i];
+    float x1 = xs[i + 1];
+    float y0 = ys[i];
+    float y1 = ys[i + 1];
+    float dx = x1 - x0;
+    float result = (dx > 1e-12f) ? (y0 + (s - x0) * (y1 - y0) / dx) : y0;
+    return result * 1000.0f;
 }
 
-// Evaluates point-wise fiber Secant Young's Modulus E_sec(strain) in Pa
+// Evaluates point-wise fiber Secant Young's Modulus E_sec(strain) in Pa (O(1) on uniform grids, O(log N) on general grids)
 inline float get_fiber_E_secant(float strain, const Material &mat) {
     if (!mat.is_nonlinear || !mat.has_valid_table()) {
         return std::max(1.0f, mat.get_active_linear_E_kpa()) * 1000.0f;
@@ -379,12 +525,42 @@ inline float get_fiber_E_secant(float strain, const Material &mat) {
         return std::max(1.0f, ys[0]) * 1000.0f;
     }
 
+    // Fast path using precomputed prefix stress table S[0..n-1]
+    if (mat.stress_table_kpa.count == n) {
+        const float* ss = mat.stress_table_kpa.items;
+        if (s >= xs[n - 1]) {
+            double y_last = std::max(1.0f, ys[n - 1]);
+            double sigma_kpa = (double)ss[n - 1] + y_last * ((double)s - (double)xs[n - 1]);
+            return (float)((sigma_kpa / (double)s) * 1000.0);
+        }
+
+        size_t i = 0;
+        if (mat.is_uniform_grid) {
+            int idx = (int)((s - xs[0]) * mat.inv_grid_step);
+            i = (size_t)std::clamp(idx, 0, (int)n - 2);
+        } else {
+            const float* it = std::upper_bound(xs, xs + n, s);
+            i = (it > xs) ? (size_t)(it - xs - 1) : 0;
+            if (i >= n - 1) i = n - 2;
+        }
+
+        double x0 = xs[i];
+        double x1 = xs[i + 1];
+        double dx = x1 - x0;
+        double y0 = std::max(1.0f, ys[i]);
+        double y1 = std::max(1.0f, ys[i + 1]);
+        double ds = (double)s - x0;
+        double ys_interp = (dx > 1e-12) ? (y0 + (ds / dx) * (y1 - y0)) : y0;
+        double sigma_kpa = (double)ss[i] + 0.5 * (y0 + ys_interp) * ds;
+        return (float)((sigma_kpa / (double)s) * 1000.0);
+    }
+
+    // Fallback prefix sum if table was mutated without sync_active_table()
     double sigma_kpa = 0.0;
     if (xs[0] > 0.0f) {
         double clamp_s = std::min((double)s, (double)xs[0]);
         sigma_kpa += clamp_s * (double)ys[0];
     }
-
     for (size_t i = 0; i < n - 1; ++i) {
         double x0 = xs[i];
         double x1 = xs[i + 1];
@@ -392,7 +568,6 @@ inline float get_fiber_E_secant(float strain, const Material &mat) {
         if (dx <= 1e-12) continue;
         double y0 = std::max(1.0f, ys[i]);
         double y1 = std::max(1.0f, ys[i + 1]);
-
         if (s >= x1) {
             sigma_kpa += 0.5 * (y0 + y1) * dx;
         } else if (s > x0) {
@@ -402,12 +577,10 @@ inline float get_fiber_E_secant(float strain, const Material &mat) {
             break;
         }
     }
-
     if (s > xs[n - 1]) {
         double y_last = std::max(1.0f, ys[n - 1]);
         sigma_kpa += y_last * ((double)s - (double)xs[n - 1]);
     }
-
     return (float)((sigma_kpa / (double)s) * 1000.0);
 }
 
@@ -417,7 +590,6 @@ inline float get_material_E(float strain, const Material &mat) {
         return get_fiber_E_secant(strain, mat);
     }
     // 4-point moment-of-area weighted quadrature across normalized depth xi in (0, 1]
-    // Weights w_q integrate (16/pi) * xi^2 * sqrt(1 - xi^2) d(xi) = 1
     static constexpr float xi_q[4] = { 0.32425342f, 0.61337143f, 0.83603111f, 0.96816024f };
     static constexpr float w_q[4]  = { 0.10122854f, 0.31234708f, 0.43392346f, 0.15250092f };
     float s = std::fabs(strain);
@@ -466,6 +638,39 @@ inline float solve_strain_from_stress(double sigma_req_pa, const Material &mat) 
         if (!found) {
             double last_slope = std::max(1.0, (double)ys[n - 1]);
             eps_est = (float)(prev_x + (sigma_kpa - prev_sig) / last_slope);
+        }
+    } else if (mat.stress_table_kpa.count == n) {
+        // Fast O(log N) inversion using precomputed cumulative stress table S[0..n-1]
+        const float* ss = mat.stress_table_kpa.items;
+        if (xs[0] > 0.0f && sigma_kpa <= (double)ss[0]) {
+            double y0 = std::max(1.0, (double)ys[0]);
+            eps_est = (float)(sigma_kpa / y0);
+        } else if (sigma_kpa >= (double)ss[n - 1]) {
+            double y_last = std::max(1.0, (double)ys[n - 1]);
+            eps_est = (float)((double)xs[n - 1] + (sigma_kpa - (double)ss[n - 1]) / y_last);
+        } else {
+            const float* it = std::upper_bound(ss, ss + n, (float)sigma_kpa);
+            size_t i = (it > ss) ? (size_t)(it - ss - 1) : 0;
+            if (i >= n - 1) i = n - 2;
+            double x0 = xs[i];
+            double x1 = xs[i + 1];
+            double dx = x1 - x0;
+            if (dx <= 1e-12) {
+                eps_est = (float)x0;
+            } else {
+                double y0 = std::max(1.0, (double)ys[i]);
+                double y1 = std::max(1.0, (double)ys[i + 1]);
+                double rem = std::max(0.0, sigma_kpa - (double)ss[i]);
+                double slope = (y1 - y0) / dx;
+                double ds = 0.0;
+                if (std::fabs(slope) < 1e-9) {
+                    ds = rem / y0;
+                } else {
+                    double disc = y0 * y0 + 2.0 * slope * rem;
+                    ds = (-y0 + std::sqrt(std::max(0.0, disc))) / slope;
+                }
+                eps_est = (float)(x0 + std::clamp(ds, 0.0, dx));
+            }
         }
     } else {
         double acc_sigma = 0.0;
@@ -537,11 +742,12 @@ inline float solve_strain_from_stress(double sigma_req_pa, const Material &mat) 
 inline float get_dia(const BendStiffner &dimensions, float x) {
     if (dimensions.length <= 1e-6f) return dimensions.root_dia;
     float s = std::clamp(x, 0.0f, dimensions.length);
-    float cyl_len = std::clamp(dimensions.root_cyl_length, 0.0f, dimensions.length - 1e-5f);
+    float max_cyl = std::max(0.0f, dimensions.length - 1e-5f);
+    float cyl_len = std::clamp(dimensions.root_cyl_length, 0.0f, max_cyl);
     if (s <= cyl_len) {
         return dimensions.root_dia;
     }
-    float cone_len = dimensions.length - cyl_len;
+    float cone_len = std::max(1e-6f, dimensions.length - cyl_len);
     float t = std::clamp((s - cyl_len) / cone_len, 0.0f, 1.0f);
     return dimensions.root_dia - (dimensions.root_dia - dimensions.tip_dia) * t;
 }
@@ -549,7 +755,7 @@ inline float get_dia(const BendStiffner &dimensions, float x) {
 inline float get_Inertia(const BendStiffner& dimensions, float x) {
     constexpr float pi_over_64 = 3.14159265358979323846f / 64.0f;
     float outer_dia = get_dia(dimensions, x);
-    float inner_dia = dimensions.inner_dia;
+    float inner_dia = std::min(outer_dia - 0.01f, get_pu_inner_dia(dimensions, x));
     float do2 = outer_dia * outer_dia;
     float di2 = inner_dia * inner_dia;
     float inertia = pi_over_64 * (do2 * do2 - di2 * di2);
@@ -559,24 +765,24 @@ inline float get_Inertia(const BendStiffner& dimensions, float x) {
 inline float get_Area(const BendStiffner& dimensions, float x) {
     constexpr float pi_over_4 = 3.14159265358979323846f / 4.0f;
     float outer_dia = get_dia(dimensions, x);
-    float inner_dia = dimensions.inner_dia;
+    float inner_dia = std::min(outer_dia - 0.01f, get_pu_inner_dia(dimensions, x));
     float area = pi_over_4 * (outer_dia * outer_dia - inner_dia * inner_dia);
     return std::max(1e-10f, area);
 }
 
 inline float get_EI(const BendStiffner& dimensions, float strain, float x) {
     float inertia = get_Inertia(dimensions, x);
-    float pipe_EI_Pa = std::max(0.0f, dimensions.pipe_EI_kNm2) * 1000.0f;
-    return get_non_linear_E(strain) * inertia + pipe_EI_Pa;
+    float passive_EI_Pa = std::max(0.0f, dimensions.pipe_EI_kNm2) * 1000.0f + get_insert_EI_Pa(dimensions, x);
+    return get_non_linear_E(strain) * inertia + passive_EI_Pa;
 }
 
 inline float get_EI(const BendStiffner& dimensions, float strain, float x, const Material &mat) {
     float inertia = get_Inertia(dimensions, x);
-    float pipe_EI_Pa = std::max(0.0f, dimensions.pipe_EI_kNm2) * 1000.0f;
-    return get_material_E(strain, mat) * inertia + pipe_EI_Pa;
+    float passive_EI_Pa = std::max(0.0f, dimensions.pipe_EI_kNm2) * 1000.0f + get_insert_EI_Pa(dimensions, x);
+    return get_material_E(strain, mat) * inertia + passive_EI_Pa;
 }
 
-// Solves the coupled composite cross-section (Polyurethane Cone + Internal Pipe EI_pipe) at station s
+// Solves the coupled composite cross-section (Polyurethane Cone + Internal Pipe EI_pipe + Steel Root Insert) at station s
 // Given total bending moment M_total [N.m] and axial tension N_axial [N], returns:
 //   out_curvature [1/m], out_total_strain [-], out_EI_total [N.m^2]
 inline void solve_composite_section(const BendStiffner &bs,
@@ -591,12 +797,19 @@ inline void solve_composite_section(const BendStiffner &bs,
     float r_o = 0.5f * d_o;
     float I_bs = get_Inertia(bs, s_pos);
     float A_bs = get_Area(bs, s_pos);
-    float pipe_EI = std::max(0.0f, bs.pipe_EI_kNm2) * 1000.0f; // N.m^2
+    float passive_EI = std::max(0.0f, bs.pipe_EI_kNm2) * 1000.0f + get_insert_EI_Pa(bs, s_pos); // N.m^2
 
     double abs_M = std::fabs((double)m_total_Nm);
     double sigma_axial = (double)std::fabs(axial_N) / (double)A_bs;
 
-    if (pipe_EI <= 1e-3f) {
+    if (abs_M <= 1e-6 && sigma_axial <= 1e-4) {
+        out_EI_total = get_material_E(0.0f, mat) * I_bs + passive_EI;
+        out_curvature = 0.0f;
+        out_total_strain = 0.0f;
+        return;
+    }
+
+    if (passive_EI <= 1e-3f) {
         // Pure bend stiffener section
         double sigma_req = (abs_M * (double)r_o) / (double)I_bs + sigma_axial;
         float eps = solve_strain_from_stress(sigma_req, mat);
@@ -607,23 +820,28 @@ inline void solve_composite_section(const BendStiffner &bs,
         return;
     }
 
-    // Composite section: M_total = (E_bs(eps) * I_bs + EI_pipe) * kappa, with eps = |kappa| * r_o + eps_axial
-    // Initialize from uncoupled estimate and refine in 3 fast iterations
+    // Composite section: M_total = (E_bs(eps) * I_bs + EI_passive) * kappa, with eps = |kappa| * r_o + eps_axial
+    // Initialize from uncoupled estimate and refine in up to 3 fast iterations
     double E0 = (double)get_material_E(0.01f, mat);
-    double frac_bs = (E0 * I_bs) / (E0 * I_bs + pipe_EI);
+    double frac_bs = (E0 * I_bs) / (E0 * I_bs + passive_EI);
     double sigma_req = (abs_M * frac_bs * (double)r_o) / (double)I_bs + sigma_axial;
     float eps = solve_strain_from_stress(sigma_req, mat);
 
     for (int k = 0; k < 3; ++k) {
         double E_bs = (double)get_material_E(eps, mat);
-        double EI_tot = E_bs * (double)I_bs + (double)pipe_EI;
+        double EI_tot = E_bs * (double)I_bs + (double)passive_EI;
         double kappa_abs = abs_M / EI_tot;
         double sigma_b = E_bs * kappa_abs * (double)r_o;
-        eps = solve_strain_from_stress(sigma_b + sigma_axial, mat);
+        float next_eps = solve_strain_from_stress(sigma_b + sigma_axial, mat);
+        if (std::fabs(next_eps - eps) <= 1e-6f) {
+            eps = next_eps;
+            break;
+        }
+        eps = next_eps;
     }
 
     float E_final = get_material_E(eps, mat);
-    out_EI_total = E_final * I_bs + pipe_EI;
+    out_EI_total = E_final * I_bs + passive_EI;
     out_curvature = m_total_Nm / out_EI_total;
     out_total_strain = eps;
 }
@@ -635,13 +853,16 @@ inline State4 equations_fast(float s_or_x,
                              const Material &mat,
                              float tension_N = 0.0f,
                              float target_angle_rad = 0.0f) {
-    float axial_N = std::fabs(tension_N) * std::max(0.0f, std::cos(target_angle_rad - y.items[1]));
+    float T_abs = std::fabs(tension_N);
+    float angle_diff = target_angle_rad - y.items[1];
+    float cos_diff = std::cos(angle_diff);
+    float axial_N = T_abs * std::max(0.0f, cos_diff);
     float kappa = 0.0f, local_strain = 0.0f, EI_total = 1.0f;
     solve_composite_section(bs, mat, s_or_x, y.items[2], axial_N, kappa, local_strain, EI_total);
 
-    bool far_field = bs.use_far_field_bc && (std::fabs(tension_N) > 1e-2f);
+    bool far_field = bs.use_far_field_bc && (T_abs > 1e-2f);
     float shear_v = far_field
-        ? (-std::fabs(tension_N) * std::sin(target_angle_rad - y.items[1]))
+        ? (-T_abs * std::sin(angle_diff))
         : y.items[3];
 
     State4 ds;
@@ -651,7 +872,7 @@ inline State4 equations_fast(float s_or_x,
         ds.items[0] = std::sin(y.items[1]);          // dy/ds = sin(theta)
         ds.items[1] = kappa;                         // dtheta/ds = M / EI_total
         ds.items[2] = shear_v;                       // dM/ds = V(s)
-        ds.items[3] = 0.0f;
+        ds.items[3] = far_field ? (T_abs * cos_diff * kappa) : 0.0f; // dV/ds = T * cos(phi_inf - theta) * dtheta/ds
     } else {
         // Legacy Cartesian x-projection formulation
         constexpr float max_theta = 1.553343f;
@@ -662,7 +883,7 @@ inline State4 equations_fast(float s_or_x,
         ds.items[0] = tan_t;
         ds.items[1] = kappa / cos_t;
         ds.items[2] = shear_v;
-        ds.items[3] = 0.0f;
+        ds.items[3] = far_field ? (T_abs * cos_diff * ds.items[1]) : 0.0f;
     }
     return ds;
 }
@@ -804,8 +1025,9 @@ inline Vec2 solve_bvp_material(const BendStiffner &bs,
         if (far_field) {
             // Exact tensioned-elastica tip moment continuity at s = L:
             // M(L) = 2 * sqrt(EI_pipe * T) * sin((phi_inf - theta(L)) / 2)
-            double angle_diff = (double)thetaL - (double)end_state.items[1];
-            double m_tip_target = 2.0 * std::sqrt(pipe_EI_Pa * T_abs) * std::sin(0.5 * angle_diff);
+            constexpr double half_pi = 1.5707963267948966;
+            double half_angle_diff = std::clamp(0.5 * ((double)thetaL - (double)end_state.items[1]), -half_pi, half_pi);
+            double m_tip_target = 2.0 * std::sqrt(pipe_EI_Pa * T_abs) * std::sin(half_angle_diff);
             return sgn * ((double)end_state.items[2] - m_tip_target);
         } else {
             return sgn * ((double)end_state.items[1] - (double)theta0) - target_abs;
@@ -915,6 +1137,21 @@ inline Vec2 solve_bvp(const BendStiffner &bs,
     return solve_bvp_material(bs, steps, y0, theta0, targetML, thetaL, default_mat, 0.0f);
 }
 
+// Local pipe curvature [1/m] accounting for annular clearance gap contact transition inside root entry span
+inline float get_local_pipe_curvature(const BendStiffner &bs, float s, float abs_kappa_beam, float abs_angle_rad) {
+    if (bs.pipe_od <= 0.0f || bs.inner_dia <= bs.pipe_od + 1e-4f || abs_angle_rad <= 1e-4f) {
+        return abs_kappa_beam;
+    }
+    float gap_m = bs.inner_dia - bs.pipe_od;
+    float L_span = get_gap_contact_span_m(bs);
+    if (s >= L_span) return abs_kappa_beam;
+    float theta_gap_rad = std::atan(gap_m / L_span);
+    float activation = std::clamp(abs_angle_rad / std::max(1e-4f, theta_gap_rad), 0.0f, 1.0f);
+    float shape = 1.0f - (s / L_span);
+    float delta_kappa = 0.25f * (gap_m / (L_span * L_span)) * activation * shape;
+    return abs_kappa_beam + delta_kappa;
+}
+
 // Calculates total outer-fiber strain, curvature [1/m], and bend radius [m] at all discretization nodes
 inline void calculate_strain_material(size_t steps,
                                       const BendStiffner &bs,
@@ -939,6 +1176,7 @@ inline void calculate_strain_material(size_t steps,
 
     float h = (n > 1) ? (bs.length / (float)(n - 1)) : 0.0f;
     float s = 0.0f;
+    float abs_tip_angle = std::fabs(tip_angle_rad);
 
     for (size_t i = 0; i < n; ++i) {
         float theta_s = results.items[i].items[1];
@@ -949,7 +1187,7 @@ inline void calculate_strain_material(size_t steps,
         solve_composite_section(bs, mat, s, m_s, axial_N, kappa, total_eps, EI_tot);
 
         strain.items[i] = total_eps;
-        float abs_kappa = std::fabs(kappa);
+        float abs_kappa = get_local_pipe_curvature(bs, s, std::fabs(kappa), abs_tip_angle);
         // In Far-Field Tension mode, also check bare pipe curvature right outside the tip exit (s = L+)
         if (i + 1 == n && bs.use_far_field_bc && std::fabs(tension_N) > 1e-2f && bs.pipe_EI_kNm2 > 1e-4f) {
             float kappa_pipe_exit = std::fabs(m_s) / (bs.pipe_EI_kNm2 * 1000.0f);
@@ -975,7 +1213,7 @@ inline void calculate_strain(size_t steps,
     calculate_strain_material(steps, bs, results, strain, default_mat, 0.0f, 0.0f, nullptr, nullptr);
 }
 
-// Calculates Polyurethane volume [m^3] (cylindrical root + conical frustum - inner bore)
+// Calculates Polyurethane volume [m^3] (cylindrical root + conical frustum - inner bore - embedded steel insert)
 inline float get_pu_volume_m3(const BendStiffner &bs) {
     if (!is_valid_geometry(bs)) return 0.0f;
     constexpr float pi = 3.14159265358979323846f;
@@ -988,7 +1226,14 @@ inline float get_pu_volume_m3(const BendStiffner &bs) {
     float v_cyl_out = (pi / 4.0f) * dr * dr * l_cyl;
     float v_cone_out = (pi / 12.0f) * l_cone * (dr * dr + dr * dt + dt * dt);
     float v_bore = (pi / 4.0f) * di * di * bs.length;
-    return std::max(0.0f, v_cyl_out + v_cone_out - v_bore);
+    float v_insert = 0.0f;
+    if (bs.insert_length > 1e-4f) {
+        float l_ins = std::min(bs.insert_length, bs.length);
+        float hi_ins = std::max(di, dr - 0.02f);
+        float d_ins = std::clamp(bs.insert_dia, di, hi_ins);
+        v_insert = (pi / 4.0f) * std::max(0.0f, d_ins * d_ins - di * di) * l_ins * 0.925f;
+    }
+    return std::max(0.0f, v_cyl_out + v_cone_out - v_bore - v_insert);
 }
 
 inline float get_pu_mass_kg(const BendStiffner &bs, float density_kg_m3 = 1150.0f) {
@@ -1012,12 +1257,17 @@ struct OptimizationConfig {
 
 inline Material scale_material(const Material &base_mat, float factor) {
     Material m = base_mat;
-    m.linear_E_kpa = base_mat.linear_E_kpa * factor;
-    for (size_t i = 0; i < m.emod_table_kpa.count; ++i) {
-        m.emod_table_kpa.items[i] = base_mat.emod_table_kpa.items[i] * factor;
-    }
+    m.linear_E_nominal_kpa = base_mat.linear_E_nominal_kpa * factor;
+    m.linear_E_cold_kpa = base_mat.linear_E_cold_kpa * factor;
+    m.linear_E_hot_kpa = base_mat.linear_E_hot_kpa * factor;
+    for (size_t i = 0; i < m.emod_nominal_kpa.count; ++i) m.emod_nominal_kpa.items[i] = base_mat.emod_nominal_kpa.items[i] * factor;
+    for (size_t i = 0; i < m.emod_cold_kpa.count; ++i)    m.emod_cold_kpa.items[i]    = base_mat.emod_cold_kpa.items[i] * factor;
+    for (size_t i = 0; i < m.emod_hot_kpa.count; ++i)     m.emod_hot_kpa.items[i]     = base_mat.emod_hot_kpa.items[i] * factor;
+    m.sync_active_table();
     return m;
 }
+
+#define OPT_GRID_N 11
 
 struct OptimizationResult {
     bool converged = false;
@@ -1028,9 +1278,30 @@ struct OptimizationResult {
     float max_strain = 0.0f;
     float min_mbr_m = 1000.0f;
     float max_root_moment_kNm = 0.0f;
+    float max_bond_stress_mpa = 0.0f;
     float strain_utilization = 0.0f;
     float mbr_utilization = 0.0f;
+    float bond_utilization = 0.0f;
     int evaluations = 0;
+
+    // 2D Design Space (L vs D_root) grid from Stage-1 global exploration
+    int grid_nL = 0;
+    int grid_nDr = 0;
+    float grid_L[OPT_GRID_N] = { 0.0f };
+    float grid_Dr[OPT_GRID_N] = { 0.0f };
+    bool grid_feasible[OPT_GRID_N][OPT_GRID_N] = { { false } };
+    float grid_max_strain[OPT_GRID_N][OPT_GRID_N] = { { 0.0f } };
+    float grid_min_mbr[OPT_GRID_N][OPT_GRID_N] = { { 0.0f } };
+    float grid_mass_kg[OPT_GRID_N][OPT_GRID_N] = { { 0.0f } };
+
+    // Interpolated Feasibility Limit Boundary Curves: Dr_min(L) for Strain Limit and MBR Limit
+    int strain_bound_count = 0;
+    float strain_bound_L[OPT_GRID_N] = { 0.0f };
+    float strain_bound_Dr[OPT_GRID_N] = { 0.0f };
+
+    int mbr_bound_count = 0;
+    float mbr_bound_L[OPT_GRID_N] = { 0.0f };
+    float mbr_bound_Dr[OPT_GRID_N] = { 0.0f };
 };
 
 // Fast stack-only evaluation of a candidate BendStiffner design for a single (angle_rad, tension_N) load case
@@ -1044,7 +1315,8 @@ inline void evaluate_candidate_single(const BendStiffner &cand,
                                       float &out_tip_half_strain,
                                       float &out_root_half_strain,
                                       float &out_min_mbr,
-                                      float &out_root_m0_kNm) {
+                                      float &out_root_m0_kNm,
+                                      float* out_bond_stress_mpa = nullptr) {
     Vec2 m0_v0 = solve_bvp_material(cand, steps, 0.0f, 0.0f, 0.0f, angle_rad, mat, tension_N);
     State4 state = { { 0.0f, 0.0f, m0_v0.x, m0_v0.y }, 0.0f };
     float h = cand.length / (float)steps;
@@ -1056,7 +1328,11 @@ inline void evaluate_candidate_single(const BendStiffner &cand,
     out_root_half_strain = 0.0f;
     float max_kappa = 0.0f;
     out_root_m0_kNm = std::fabs(m0_v0.x) / 1000.0f;
+    if (out_bond_stress_mpa) {
+        *out_bond_stress_mpa = get_insert_bond_stress_mpa(cand, m0_v0.x, m0_v0.y);
+    }
 
+    float abs_angle = std::fabs(angle_rad);
     size_t n_nodes = steps + 1;
     for (size_t i = 0; i < n_nodes; ++i) {
         float axial_N = std::fabs(tension_N) * std::max(0.0f, std::cos(angle_rad - state.items[1]));
@@ -1071,7 +1347,7 @@ inline void evaluate_candidate_single(const BendStiffner &cand,
         }
         out_avg_strain += eps;
 
-        float abs_k = std::fabs(kappa);
+        float abs_k = get_local_pipe_curvature(cand, s, std::fabs(kappa), abs_angle);
         if (i + 1 == n_nodes && cand.use_far_field_bc && std::fabs(tension_N) > 1e-2f && cand.pipe_EI_kNm2 > 1e-4f) {
             float k_exit = std::fabs(state.items[2]) / (cand.pipe_EI_kNm2 * 1000.0f);
             abs_k = std::max(abs_k, k_exit);
@@ -1153,10 +1429,21 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
 
     float allow_eps_eff = std::max(1e-4f, initial_bs.allowable_strain * std::clamp(cfg.safety_margin, 0.5f, 1.0f));
     float allow_mbr_eff = std::max(0.1f, initial_bs.allowable_mbr_m / std::clamp(cfg.safety_margin, 0.5f, 1.0f));
+    float allow_bond_eff = std::max(0.05f, initial_bs.allowable_bond_stress_mpa * std::clamp(cfg.safety_margin, 0.5f, 1.0f));
     float pipe_EI_Pa = std::max(0.0f, initial_bs.pipe_EI_kNm2) * 1000.0f;
 
+    // Pre-build temperature material instances ONCE outside eval_objective (zero heap allocations during optimization!)
+    int n_temps = cfg.include_temp_envelope ? 3 : 1;
+    Material pre_mats[3] = {
+        cfg.include_temp_envelope ? mat.with_temp_mode(MAT_TEMP_NOMINAL) : mat,
+        mat.with_temp_mode(MAT_TEMP_COLD),
+        mat.with_temp_mode(MAT_TEMP_HOT)
+    };
+    double e0_root_pa = (double)get_material_E(0.01f, pre_mats[0]);
+
     auto eval_objective = [&](float L, float Dr, size_t steps,
-                              bool &out_feas, float &out_max_eps, float &out_min_mbr, float &out_max_m0) -> double {
+                              bool &out_feas, float &out_max_eps, float &out_min_mbr,
+                              float &out_max_m0, float &out_max_bond) -> double {
         res.evaluations++;
         Dr = std::max(Dr, fixed_Dt + 0.02f);
 
@@ -1169,24 +1456,23 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
         float worst_eps = 0.0f;
         float worst_mbr = 1000.0f;
         float worst_m0 = 0.0f;
+        float worst_bond = 0.0f;
         float avg_eps_accum = 0.0f;
 
-        int temp_modes[3] = { MAT_TEMP_NOMINAL, MAT_TEMP_COLD, MAT_TEMP_HOT };
-        int n_temps = cfg.include_temp_envelope ? 3 : 1;
-
         for (int t_idx = 0; t_idx < n_temps; ++t_idx) {
-            Material case_mat = (t_idx == 0 && !cfg.include_temp_envelope) ? mat : mat.with_temp_mode(temp_modes[t_idx]);
+            const Material &case_mat = pre_mats[t_idx];
             for (int c = 0; c < num_cases; ++c) {
                 BendStiffner case_bs = cand;
                 if (cfg.force_far_field_when_tension && std::fabs(cases[c].tension_N) > 10.0f) {
                     case_bs.use_far_field_bc = true;
                 }
-                float c_max_eps = 0.0f, c_avg_eps = 0.0f, c_tip_eps = 0.0f, c_root_eps = 0.0f, c_mbr = 1000.0f, c_m0 = 0.0f;
+                float c_max_eps = 0.0f, c_avg_eps = 0.0f, c_tip_eps = 0.0f, c_root_eps = 0.0f, c_mbr = 1000.0f, c_m0 = 0.0f, c_bond = 0.0f;
                 evaluate_candidate_single(case_bs, case_mat, steps, cases[c].angle_rad, cases[c].tension_N,
-                                          c_max_eps, c_avg_eps, c_tip_eps, c_root_eps, c_mbr, c_m0);
+                                          c_max_eps, c_avg_eps, c_tip_eps, c_root_eps, c_mbr, c_m0, &c_bond);
                 if (c_max_eps > worst_eps) worst_eps = c_max_eps;
                 if (c_mbr < worst_mbr) worst_mbr = c_mbr;
                 if (c_m0 > worst_m0) worst_m0 = c_m0;
+                if (c_bond > worst_bond) worst_bond = c_bond;
                 avg_eps_accum += c_avg_eps;
             }
         }
@@ -1195,19 +1481,21 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
         out_max_eps = worst_eps;
         out_min_mbr = worst_mbr;
         out_max_m0 = worst_m0;
+        out_max_bond = worst_bond;
 
         double u_eps = (double)worst_eps / (double)allow_eps_eff;
         double u_mbr = (double)allow_mbr_eff / std::max(1e-4, (double)worst_mbr);
+        double u_bond = (cand.insert_length > 1e-4f) ? ((double)worst_bond / (double)allow_bond_eff) : 0.0;
 
         // Minimum root stiffness requirement relative to internal pipe when tension is zero
-        double EI_bs_root = (double)get_material_E(0.01f, mat) * (double)get_Inertia(cand, 0.0f);
+        double EI_bs_root = e0_root_pa * (double)get_Inertia(cand, 0.0f) + (double)get_insert_EI_Pa(cand, 0.0f);
         double u_stiff = 0.0;
         if (pipe_EI_Pa > 1.0f) {
             double req_root_EI = (double)cfg.min_root_stiffness_ratio * (double)pipe_EI_Pa;
             u_stiff = req_root_EI / std::max(1.0, EI_bs_root);
         }
 
-        out_feas = (u_eps <= 1.0) && (u_mbr <= 1.0) && (u_stiff <= 1.0);
+        out_feas = (u_eps <= 1.0) && (u_mbr <= 1.0) && (u_stiff <= 1.0) && (u_bond <= 1.0);
 
         double vol = (double)get_pu_volume_m3(cand);
         double non_uniformity = (worst_eps > 1e-6f) ? ((double)(worst_eps - avg_eps_accum) / (double)worst_eps) : 0.0;
@@ -1220,26 +1508,46 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
         double pen = 0.0;
         if (u_eps > 1.0)   pen += (u_eps - 1.0) * (u_eps - 1.0) * 100.0;
         if (u_mbr > 1.0)   pen += (u_mbr - 1.0) * (u_mbr - 1.0) * 100.0;
+        if (u_bond > 1.0)  pen += (u_bond - 1.0) * (u_bond - 1.0) * 50.0;
         if (u_stiff > 1.0) pen += (u_stiff - 1.0) * (u_stiff - 1.0) * 25.0;
         return 1000.0 + pen + 0.1 * base_cost;
     };
 
     // Stage 1: 2D Global Grid Search over (Length L, Root Diameter D_root)
     const size_t coarse_steps = 20;
-    int nL  = cfg.optimize_length ? 11 : 1;
-    int nDr = cfg.optimize_root_dia ? 11 : 1;
+    int nL  = cfg.optimize_length ? OPT_GRID_N : 1;
+    int nDr = cfg.optimize_root_dia ? OPT_GRID_N : 1;
+    res.grid_nL = nL;
+    res.grid_nDr = nDr;
 
     float best_L = std::clamp(initial_bs.length, L_lo, L_hi);
     float best_Dr = std::clamp(initial_bs.root_dia, Dr_lo, Dr_hi);
     double best_cost = 1e30;
 
+    for (int iDr = 0; iDr < nDr; ++iDr) {
+        res.grid_Dr[iDr] = (nDr > 1) ? (Dr_lo + (Dr_hi - Dr_lo) * (float)iDr / (float)(nDr - 1)) : Dr_lo;
+    }
+
     for (int iL = 0; iL < nL; ++iL) {
         float L = (nL > 1) ? (L_lo + (L_hi - L_lo) * (float)iL / (float)(nL - 1)) : L_lo;
+        res.grid_L[iL] = L;
         for (int iDr = 0; iDr < nDr; ++iDr) {
-            float Dr = (nDr > 1) ? (Dr_lo + (Dr_hi - Dr_lo) * (float)iDr / (float)(nDr - 1)) : Dr_lo;
+            float Dr = res.grid_Dr[iDr];
             bool feas = false;
-            float me = 0, mm = 0, m0 = 0;
-            double cost = eval_objective(L, Dr, coarse_steps, feas, me, mm, m0);
+            float me = 0, mm = 0, m0 = 0, mb = 0;
+            double cost = eval_objective(L, Dr, coarse_steps, feas, me, mm, m0, mb);
+
+            BendStiffner g_bs = initial_bs;
+            g_bs.length = L;
+            g_bs.root_dia = std::max(Dr, fixed_Dt + 0.02f);
+            g_bs.tip_dia = fixed_Dt;
+            g_bs.root_cyl_length = std::clamp(cfg.cyl_length_ratio * L, 0.0f, 0.5f * L);
+
+            res.grid_feasible[iL][iDr] = feas;
+            res.grid_max_strain[iL][iDr] = me;
+            res.grid_min_mbr[iL][iDr] = mm;
+            res.grid_mass_kg[iL][iDr] = get_pu_mass_kg(g_bs);
+
             if (cost < best_cost) {
                 best_cost = cost;
                 best_L = L;
@@ -1248,11 +1556,55 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
         }
     }
 
+    // Interpolate 1D Feasibility Boundary Curves Dr_min(L) for Strain Limit and MBR Limit
+    if (nL > 1 && nDr > 1) {
+        res.strain_bound_count = nL;
+        res.mbr_bound_count = nL;
+        for (int iL = 0; iL < nL; ++iL) {
+            res.strain_bound_L[iL] = res.grid_L[iL];
+            res.mbr_bound_L[iL] = res.grid_L[iL];
+
+            // Strain Limit Boundary: find lowest Dr where max_strain <= allow_eps_eff
+            float dr_strain = res.grid_Dr[nDr - 1];
+            if (res.grid_max_strain[iL][0] <= allow_eps_eff) {
+                dr_strain = res.grid_Dr[0];
+            } else {
+                for (int iDr = 0; iDr + 1 < nDr; ++iDr) {
+                    float e0 = res.grid_max_strain[iL][iDr];
+                    float e1 = res.grid_max_strain[iL][iDr + 1];
+                    if ((e0 - allow_eps_eff) * (e1 - allow_eps_eff) <= 0.0f && std::fabs(e1 - e0) > 1e-6f) {
+                        float t = std::clamp((allow_eps_eff - e0) / (e1 - e0), 0.0f, 1.0f);
+                        dr_strain = res.grid_Dr[iDr] + t * (res.grid_Dr[iDr + 1] - res.grid_Dr[iDr]);
+                        break;
+                    }
+                }
+            }
+            res.strain_bound_Dr[iL] = dr_strain;
+
+            // MBR Limit Boundary: find lowest Dr where min_mbr >= allow_mbr_eff
+            float dr_mbr = res.grid_Dr[nDr - 1];
+            if (res.grid_min_mbr[iL][0] >= allow_mbr_eff) {
+                dr_mbr = res.grid_Dr[0];
+            } else {
+                for (int iDr = 0; iDr + 1 < nDr; ++iDr) {
+                    float m0 = res.grid_min_mbr[iL][iDr];
+                    float m1 = res.grid_min_mbr[iL][iDr + 1];
+                    if ((m0 - allow_mbr_eff) * (m1 - allow_mbr_eff) <= 0.0f && std::fabs(m1 - m0) > 1e-6f) {
+                        float t = std::clamp((allow_mbr_eff - m0) / (m1 - m0), 0.0f, 1.0f);
+                        dr_mbr = res.grid_Dr[iDr] + t * (res.grid_Dr[iDr + 1] - res.grid_Dr[iDr]);
+                        break;
+                    }
+                }
+            }
+            res.mbr_bound_Dr[iL] = dr_mbr;
+        }
+    }
+
     // Stage 2: Multi-scale 2D coordinate pattern search refinement at full resolution
     const size_t fine_steps = (DISCRETIZATION > 1) ? (DISCRETIZATION - 1) : 24;
     bool feas_now = false;
-    float eps_now = 0, mbr_now = 0, m0_now = 0;
-    best_cost = eval_objective(best_L, best_Dr, fine_steps, feas_now, eps_now, mbr_now, m0_now);
+    float eps_now = 0, mbr_now = 0, m0_now = 0, bond_now = 0;
+    best_cost = eval_objective(best_L, best_Dr, fine_steps, feas_now, eps_now, mbr_now, m0_now, bond_now);
 
     float step_scales[4] = { 0.10f, 0.035f, 0.010f, 0.002f };
     for (int sc = 0; sc < 4; ++sc) {
@@ -1264,8 +1616,8 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
             if (cfg.optimize_length && dL > 1e-4f) {
                 for (int dir = -1; dir <= 1; dir += 2) {
                     float cand_L = std::clamp(best_L + (float)dir * dL, L_lo, L_hi);
-                    bool f = false; float me = 0, mm = 0, m0 = 0;
-                    double c = eval_objective(cand_L, best_Dr, fine_steps, f, me, mm, m0);
+                    bool f = false; float me = 0, mm = 0, m0 = 0, mb = 0;
+                    double c = eval_objective(cand_L, best_Dr, fine_steps, f, me, mm, m0, mb);
                     if (c < best_cost) {
                         best_cost = c; best_L = cand_L; improved = true;
                     }
@@ -1274,8 +1626,8 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
             if (cfg.optimize_root_dia && dDr > 1e-4f) {
                 for (int dir = -1; dir <= 1; dir += 2) {
                     float cand_Dr = std::clamp(best_Dr + (float)dir * dDr, Dr_lo, Dr_hi);
-                    bool f = false; float me = 0, mm = 0, m0 = 0;
-                    double c = eval_objective(best_L, cand_Dr, fine_steps, f, me, mm, m0);
+                    bool f = false; float me = 0, mm = 0, m0 = 0, mb = 0;
+                    double c = eval_objective(best_L, cand_Dr, fine_steps, f, me, mm, m0, mb);
                     if (c < best_cost) {
                         best_cost = c; best_Dr = cand_Dr; improved = true;
                     }
@@ -1286,7 +1638,7 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
     }
 
     // Final evaluation of optimal design
-    eval_objective(best_L, best_Dr, fine_steps, res.feasible, res.max_strain, res.min_mbr_m, res.max_root_moment_kNm);
+    eval_objective(best_L, best_Dr, fine_steps, res.feasible, res.max_strain, res.min_mbr_m, res.max_root_moment_kNm, res.max_bond_stress_mpa);
     res.converged = true;
     res.best_bs = initial_bs;
     res.best_bs.length = std::round(best_L * 1000.0f) / 1000.0f;
@@ -1298,6 +1650,7 @@ inline OptimizationResult optimize_bend_stiffener(const BendStiffner &initial_bs
     res.mass_kg = get_pu_mass_kg(res.best_bs);
     res.strain_utilization = (initial_bs.allowable_strain > 1e-5f) ? (res.max_strain / initial_bs.allowable_strain) : 0.0f;
     res.mbr_utilization = (res.min_mbr_m > 1e-5f) ? (initial_bs.allowable_mbr_m / res.min_mbr_m) : 0.0f;
+    res.bond_utilization = (initial_bs.allowable_bond_stress_mpa > 1e-5f) ? (res.max_bond_stress_mpa / initial_bs.allowable_bond_stress_mpa) : 0.0f;
     return res;
 }
 
@@ -1468,6 +1821,8 @@ inline bool save_project_file(const char* filename,
                  bs.length, bs.root_dia, bs.tip_dia, bs.inner_dia,
                  bs.root_cyl_length, bs.pipe_EI_kNm2, bs.allowable_strain, bs.allowable_mbr_m,
                  (int)bs.use_arc_length, (int)bs.use_far_field_bc);
+    std::fprintf(f, "geometry_ext %.6f %.6f %.6f %.6f %.6f\n",
+                 bs.pipe_od, bs.insert_length, bs.insert_dia, bs.insert_EI_kNm2, bs.allowable_bond_stress_mpa);
     std::fprintf(f, "loading %.6f %.6f\n", target_angle_deg, target_tension_kN);
     std::fprintf(f, "optimizer %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d %d\n",
                  opt_cfg.min_length, opt_cfg.max_length, opt_cfg.min_root_dia, opt_cfg.max_root_dia,
@@ -1527,6 +1882,9 @@ inline bool load_project_file(const char* filename,
                 bs.use_arc_length = (arc != 0);
                 bs.use_far_field_bc = (ff != 0);
             }
+        } else if (std::strcmp(tag, "geometry_ext") == 0) {
+            std::fscanf(f, "%f %f %f %f %f",
+                        &bs.pipe_od, &bs.insert_length, &bs.insert_dia, &bs.insert_EI_kNm2, &bs.allowable_bond_stress_mpa);
         } else if (std::strcmp(tag, "loading") == 0) {
             std::fscanf(f, "%f %f", &target_angle_deg, &target_tension_kN);
         } else if (std::strcmp(tag, "optimizer") == 0) {
@@ -1610,5 +1968,381 @@ inline bool load_project_file(const char* filename,
     std::fclose(f);
     return true;
 }
+
+// Generates a self-contained HTML5 Engineering Calculation Report with embedded Vector SVG charts
+inline bool generate_html_report(const char* filename,
+                                 const BendStiffner &bs,
+                                 const Material &mat,
+                                 float target_angle_deg,
+                                 float target_tension_kN,
+                                 float root_moment_kNm,
+                                 float root_shear_kN,
+                                 float root_axial_kN,
+                                 const float* x_stations,
+                                 const float* def_x,
+                                 const float* def_y,
+                                 const float* angle_rad,
+                                 const float* moment_Nm,
+                                 const float* shear_N,
+                                 const float* strain_arr,
+                                 const float* curvature_arr,
+                                 const float* mbr_arr,
+                                 size_t n_nodes,
+                                 const float* tail_x = nullptr,
+                                 const float* tail_y = nullptr,
+                                 size_t n_tail = 0) {
+    if (!filename || n_nodes < 2) return false;
+    FILE* f = std::fopen(filename, "w");
+    if (!f) return false;
+
+    float max_strain = 0.0f;
+    float max_strain_s = 0.0f;
+    float min_mbr = 1000.0f;
+    float min_mbr_s = 0.0f;
+    for (size_t i = 0; i < n_nodes; ++i) {
+        if (strain_arr[i] > max_strain) {
+            max_strain = strain_arr[i];
+            max_strain_s = x_stations[i];
+        }
+        if (mbr_arr[i] < min_mbr) {
+            min_mbr = mbr_arr[i];
+            min_mbr_s = x_stations[i];
+        }
+    }
+
+    float pu_vol_m3 = get_pu_volume_m3(bs);
+    float pu_mass_kg = get_pu_mass_kg(bs);
+    float bond_stress_mpa = get_insert_bond_stress_mpa(bs, root_moment_kNm * 1000.0f, root_shear_kN * 1000.0f);
+    float gap_mm = get_annular_gap_mm(bs);
+    float gap_angle_deg = get_gap_contact_angle_deg(bs);
+    float resultant_kN = std::sqrt(root_shear_kN * root_shear_kN + root_axial_kN * root_axial_kN);
+
+    float u_strain = (bs.allowable_strain > 1e-5f) ? (max_strain / bs.allowable_strain) : 0.0f;
+    float u_mbr = (min_mbr > 1e-5f) ? (bs.allowable_mbr_m / min_mbr) : 0.0f;
+    float u_bond = (bs.insert_length > 1e-4f && bs.allowable_bond_stress_mpa > 1e-5f)
+                   ? (bond_stress_mpa / bs.allowable_bond_stress_mpa) : 0.0f;
+
+    bool pass_strain = (max_strain <= bs.allowable_strain);
+    bool pass_mbr = (min_mbr >= bs.allowable_mbr_m);
+    bool pass_bond = (bs.insert_length <= 1e-4f) || (bond_stress_mpa <= bs.allowable_bond_stress_mpa);
+    bool overall_pass = pass_strain && pass_mbr && pass_bond;
+
+    TemperatureEnvelopeSummary temp_env = evaluate_temperature_envelope(bs, mat, target_angle_deg, target_tension_kN);
+
+    std::fprintf(f, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n");
+    std::fprintf(f, "<title>Bend Stiffener Engineering Calculation Report</title>\n");
+    std::fprintf(f, "<style>\n"
+                    ":root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f1f5f9; --muted: #94a3b8; "
+                    "--accent: #38bdf8; --pass: #22c55e; --fail: #ef4444; --warn: #f59e0b; }\n"
+                    "@media print { :root { --bg: #ffffff; --card: #f8fafc; --border: #cbd5e1; --text: #0f172a; --muted: #475569; } }\n"
+                    "* { box-sizing: border-box; }\n"
+                    "body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); "
+                    "margin: 0; padding: 28px 36px; line-height: 1.5; }\n"
+                    ".container { max-width: 1240px; margin: 0 auto; }\n"
+                    ".header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; }\n"
+                    "h1 { margin: 0; font-size: 24px; color: var(--accent); letter-spacing: 0.3px; }\n"
+                    "h2 { font-size: 17px; color: var(--accent); border-left: 4px solid var(--accent); padding-left: 10px; margin: 26px 0 12px 0; }\n"
+                    ".badge { padding: 6px 14px; border-radius: 6px; font-weight: 700; font-size: 14px; display: inline-block; }\n"
+                    ".badge-pass { background: rgba(34, 197, 94, 0.18); color: var(--pass); border: 1px solid var(--pass); }\n"
+                    ".badge-fail { background: rgba(239, 68, 68, 0.18); color: var(--fail); border: 1px solid var(--fail); }\n"
+                    ".grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }\n"
+                    ".grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-bottom: 20px; }\n"
+                    ".card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }\n"
+                    ".kpi-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }\n"
+                    ".kpi-val { font-size: 22px; font-weight: 700; margin: 4px 0; }\n"
+                    ".kpi-sub { font-size: 12px; color: var(--muted); }\n"
+                    "table { width: 100%%; border-collapse: collapse; font-size: 13px; background: var(--card); border-radius: 8px; overflow: hidden; }\n"
+                    "th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }\n"
+                    "th { background: rgba(56, 189, 248, 0.1); color: var(--accent); font-weight: 600; }\n"
+                    "svg { width: 100%%; height: auto; background: #0b1120; border: 1px solid var(--border); border-radius: 6px; }\n"
+                    "</style>\n</head>\n<body>\n<div class=\"container\">\n");
+
+    std::fprintf(f, "<div class=\"header\">\n"
+                    "<div><h1>Bend Stiffener Nonlinear Elastica Engineering Report</h1>\n"
+                    "<div style=\"color:var(--muted);font-size:13px;\">BS Engine &bull; Coupled Composite Polyurethane + Pipe + Root Insert Solver &bull; %s</div></div>\n"
+                    "<div class=\"badge %s\">%s</div>\n</div>\n",
+                 bs.use_far_field_bc ? "OrcaFlex Far-Field Tension Elastica BC" : "Prescribed Tip Angle BC",
+                 overall_pass ? "badge-pass" : "badge-fail",
+                 overall_pass ? "OVERALL DESIGN: PASS" : "OVERALL DESIGN: LIMIT EXCEEDED");
+
+    // KPI Cards
+    std::fprintf(f, "<div class=\"grid-4\">\n");
+    std::fprintf(f, "<div class=\"card\"><div class=\"kpi-label\">Peak Polyurethane Strain</div>"
+                    "<div class=\"kpi-val\" style=\"color:%s;\">%.2f%%</div>"
+                    "<div class=\"kpi-sub\">Allowable: %.2f%% (Util: %.1f%% @ s=%.2fm)</div></div>\n",
+                 pass_strain ? "var(--pass)" : "var(--fail)",
+                 max_strain * 100.0f, bs.allowable_strain * 100.0f, u_strain * 100.0f, max_strain_s);
+
+    std::fprintf(f, "<div class=\"card\"><div class=\"kpi-label\">Minimum Pipe Bend Radius</div>"
+                    "<div class=\"kpi-val\" style=\"color:%s;\">%.2f m</div>"
+                    "<div class=\"kpi-sub\">Allowable MBR: %.2f m (Util: %.1f%% @ s=%.2fm)</div></div>\n",
+                 pass_mbr ? "var(--pass)" : "var(--fail)",
+                 min_mbr, bs.allowable_mbr_m, u_mbr * 100.0f, min_mbr_s);
+
+    std::fprintf(f, "<div class=\"card\"><div class=\"kpi-label\">Hang-Off Flange Reactions</div>"
+                    "<div class=\"kpi-val\">M<sub>0</sub> = %.2f kN&middot;m</div>"
+                    "<div class=\"kpi-sub\">V<sub>0</sub> = %.2f kN &bull; N<sub>0</sub> = %.2f kN (|R| = %.2f kN)</div></div>\n",
+                 std::fabs(root_moment_kNm), std::fabs(root_shear_kN), std::fabs(root_axial_kN), resultant_kN);
+
+    std::fprintf(f, "<div class=\"card\"><div class=\"kpi-label\">PU Volume, Mass &amp; Root Bond</div>"
+                    "<div class=\"kpi-val\">%.1f kg <span style=\"font-size:14px;color:var(--muted);\">(%.3f m&sup3;)</span></div>"
+                    "<div class=\"kpi-sub\">Insert Bond: %.2f / %.2f MPa &bull; Gap: %.1f mm</div></div>\n",
+                 pu_mass_kg, pu_vol_m3, bond_stress_mpa, bs.allowable_bond_stress_mpa, gap_mm);
+    std::fprintf(f, "</div>\n");
+
+    // Input Summary Tables (2 columns)
+    std::fprintf(f, "<div class=\"grid-2\">\n");
+    std::fprintf(f, "<div class=\"card\"><h2 style=\"margin-top:0;\">1. Geometry &amp; Mechanical Parameters</h2><table>\n"
+                    "<tr><th>Parameter</th><th>Symbol</th><th>Value</th><th>Units</th></tr>\n"
+                    "<tr><td>Total Stiffener Length</td><td>L</td><td>%.3f</td><td>m</td></tr>\n"
+                    "<tr><td>Cylindrical Base Length</td><td>L<sub>cyl</sub></td><td>%.3f</td><td>m</td></tr>\n"
+                    "<tr><td>Outer Root Diameter</td><td>D<sub>root</sub></td><td>%.3f</td><td>m</td></tr>\n"
+                    "<tr><td>Outer Tip Diameter</td><td>D<sub>tip</sub></td><td>%.3f</td><td>m</td></tr>\n"
+                    "<tr><td>Inner Bore Diameter</td><td>D<sub>i</sub></td><td>%.3f</td><td>m</td></tr>\n"
+                    "<tr><td>Flexible Pipe Outer Diameter</td><td>D<sub>pipe</sub></td><td>%.3f (Gap: %.1f mm, &Delta;&theta;<sub>gap</sub>: %.2f&deg;)</td><td>m</td></tr>\n"
+                    "<tr><td>Embedded Steel Insert Sleeve</td><td>L<sub>ins</sub> &times; D<sub>ins</sub></td><td>%.3f m &times; %.3f m (EI<sub>ins</sub> = %.0f kN&middot;m&sup2;)</td><td>-</td></tr>\n"
+                    "<tr><td>Internal Pipe Bending Stiffness</td><td>EI<sub>pipe</sub></td><td>%.2f</td><td>kN&middot;m&sup2;</td></tr>\n"
+                    "</table></div>\n",
+                 bs.length, bs.root_cyl_length, bs.root_dia, bs.tip_dia, bs.inner_dia,
+                 bs.pipe_od, gap_mm, gap_angle_deg, bs.insert_length, bs.insert_dia, bs.insert_EI_kNm2, bs.pipe_EI_kNm2);
+
+    const char* active_temp_label = (mat.active_temp_mode == MAT_TEMP_COLD) ? "Cold" :
+                                    (mat.active_temp_mode == MAT_TEMP_HOT) ? "Hot" : "Nominal";
+    float active_temp_c = (mat.active_temp_mode == MAT_TEMP_COLD) ? mat.temp_cold_c :
+                          (mat.active_temp_mode == MAT_TEMP_HOT) ? mat.temp_hot_c : mat.temp_nominal_c;
+
+    std::fprintf(f, "<div class=\"card\"><h2 style=\"margin-top:0;\">2. Loading, Boundary Conditions &amp; Criteria</h2><table>\n"
+                    "<tr><th>Parameter</th><th>Value</th><th>Verification Status</th></tr>\n"
+                    "<tr><td>Applied Bend Angle</td><td>%.2f deg</td><td>%s</td></tr>\n"
+                    "<tr><td>Applied Far-Field Tension</td><td>%.2f kN</td><td>%s</td></tr>\n"
+                    "<tr><td>Active Material Temperature Curve</td><td>%s (%.1f &deg;C)</td><td>Initial E<sub>0</sub> = %.1f MPa</td></tr>\n"
+                    "<tr><td>Cross-Sectional Stress Integration</td><td>%s</td><td>%s</td></tr>\n"
+                    "<tr><td>Polyurethane Outer-Fiber Strain Check</td><td>%.2f%% &le; %.2f%%</td><td><b style=\"color:%s;\">%s (%.1f%%)</b></td></tr>\n"
+                    "<tr><td>Flexible Pipe Minimum Bend Radius Check</td><td>%.2f m &ge; %.2f m</td><td><b style=\"color:%s;\">%s (%.1f%%)</b></td></tr>\n"
+                    "<tr><td>Steel Insert Interface Bond Shear Check</td><td>%.3f MPa &le; %.2f MPa</td><td><b style=\"color:%s;\">%s (%.1f%%)</b></td></tr>\n"
+                    "</table></div>\n",
+                 target_angle_deg, bs.use_arc_length ? "Exact Arc-Length Elastica (s)" : "Cartesian Projection",
+                 target_tension_kN, bs.use_far_field_bc ? "OrcaFlex Far-Field Elastica BC" : "Prescribed Tip Angle BC",
+                 active_temp_label, active_temp_c, get_material_E(0.0f, mat) / 1e6f,
+                 mat.use_cross_section_integration ? "4-Point Gauss Annular Integration" : "Outer-Fiber Direct Evaluation",
+                 mat.table_is_tangent_modulus ? "Tangent-to-Secant Integrated" : "Direct Secant Table",
+                 max_strain * 100.0f, bs.allowable_strain * 100.0f, pass_strain ? "var(--pass)" : "var(--fail)", pass_strain ? "PASS" : "FAIL", u_strain * 100.0f,
+                 min_mbr, bs.allowable_mbr_m, pass_mbr ? "var(--pass)" : "var(--fail)", pass_mbr ? "PASS" : "FAIL", u_mbr * 100.0f,
+                 bond_stress_mpa, bs.allowable_bond_stress_mpa, pass_bond ? "var(--pass)" : "var(--fail)", pass_bond ? "PASS" : "FAIL", u_bond * 100.0f);
+    std::fprintf(f, "</div>\n");
+
+    // Vector SVG Charts (2x2 Grid)
+    std::fprintf(f, "<h2>3. Engineering Verification Charts (Vector SVG)</h2>\n<div class=\"grid-2\">\n");
+
+    // SVG 1: 2D Geometry, Steel Insert & Deformed Elastica + Pipe Tail
+    {
+        float x_max = bs.length;
+        float y_min = -0.6f * bs.root_dia;
+        float y_max = 0.6f * bs.root_dia;
+        for (size_t i = 0; i < n_nodes; ++i) {
+            x_max = std::max(x_max, def_x[i]);
+            y_min = std::min(y_min, def_y[i]);
+            y_max = std::max(y_max, def_y[i]);
+        }
+        if (tail_x && tail_y && n_tail > 0) {
+            for (size_t i = 0; i < n_tail; ++i) {
+                x_max = std::max(x_max, tail_x[i]);
+                y_min = std::min(y_min, tail_y[i]);
+                y_max = std::max(y_max, tail_y[i]);
+            }
+        }
+        float pad_x = 0.12f * std::max(1.0f, x_max);
+        float pad_y = 0.18f * std::max(0.5f, y_max - y_min);
+        float vx0 = -0.1f, vx1 = x_max + pad_x;
+        float vy0 = y_min - pad_y, vy1 = y_max + pad_y;
+        const float W = 560.0f, H = 300.0f;
+        const float ML = 52.0f, MR = 20.0f, MT = 26.0f, MB = 36.0f;
+        auto sx = [&](float xv) { return ML + (xv - vx0) / std::max(1e-5f, vx1 - vx0) * (W - ML - MR); };
+        auto sy = [&](float yv) { return MT + (vy1 - yv) / std::max(1e-5f, vy1 - vy0) * (H - MT - MB); };
+
+        std::fprintf(f, "<div class=\"card\"><div style=\"font-weight:600;margin-bottom:8px;\">3.1 Bend Stiffener Profile, Steel Insert &amp; 2D Deformed Elastica</div>\n");
+        std::fprintf(f, "<svg viewBox=\"0 0 %.0f %.0f\">\n", W, H);
+        std::fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#334155\" stroke-dasharray=\"4,4\"/>\n",
+                     sx(0.0f), sy(0.0f), sx(x_max), sy(0.0f));
+        // Outer cone profile
+        std::fprintf(f, "<polyline fill=\"none\" stroke=\"#38bdf8\" stroke-width=\"2\" points=\"");
+        for (size_t i = 0; i < n_nodes; ++i) std::fprintf(f, "%.1f,%.1f ", sx(x_stations[i]), sy(0.5f * get_dia(bs, x_stations[i])));
+        std::fprintf(f, "\"/>\n<polyline fill=\"none\" stroke=\"#38bdf8\" stroke-width=\"2\" points=\"");
+        for (size_t i = 0; i < n_nodes; ++i) std::fprintf(f, "%.1f,%.1f ", sx(x_stations[i]), sy(-0.5f * get_dia(bs, x_stations[i])));
+        std::fprintf(f, "\"/>\n");
+        // Inner bore
+        std::fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#64748b\" stroke-dasharray=\"3,3\"/>\n",
+                     sx(0.0f), sy(0.5f * bs.inner_dia), sx(bs.length), sy(0.5f * bs.inner_dia));
+        std::fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#64748b\" stroke-dasharray=\"3,3\"/>\n",
+                     sx(0.0f), sy(-0.5f * bs.inner_dia), sx(bs.length), sy(-0.5f * bs.inner_dia));
+        // Embedded steel insert
+        if (bs.insert_length > 1e-4f) {
+            float hi_ins = std::max(bs.inner_dia, bs.root_dia - 0.02f);
+            float r_ins = 0.5f * std::clamp(bs.insert_dia, bs.inner_dia, hi_ins);
+            float r_in = 0.5f * bs.inner_dia;
+            std::fprintf(f, "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" fill=\"rgba(245,158,11,0.35)\" stroke=\"#f59e0b\" stroke-width=\"1.5\"/>\n",
+                         sx(0.0f), sy(r_ins), sx(bs.insert_length) - sx(0.0f), sy(r_in) - sy(r_ins));
+            std::fprintf(f, "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" fill=\"rgba(245,158,11,0.35)\" stroke=\"#f59e0b\" stroke-width=\"1.5\"/>\n",
+                         sx(0.0f), sy(-r_in), sx(bs.insert_length) - sx(0.0f), sy(-r_ins) - sy(-r_in));
+        }
+        // Deformed elastica centerline
+        std::fprintf(f, "<polyline fill=\"none\" stroke=\"#22c55e\" stroke-width=\"2.6\" points=\"");
+        for (size_t i = 0; i < n_nodes; ++i) std::fprintf(f, "%.1f,%.1f ", sx(def_x[i]), sy(def_y[i]));
+        std::fprintf(f, "\"/>\n");
+        // Bare pipe tail
+        if (tail_x && tail_y && n_tail > 0) {
+            std::fprintf(f, "<polyline fill=\"none\" stroke=\"#f97316\" stroke-width=\"2.2\" stroke-dasharray=\"5,3\" points=\"");
+            for (size_t i = 0; i < n_tail; ++i) std::fprintf(f, "%.1f,%.1f ", sx(tail_x[i]), sy(tail_y[i]));
+            std::fprintf(f, "\"/>\n");
+        }
+        std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#94a3b8\" font-size=\"11\">X [m] (0 to %.2f m) | Blue: Cone | Amber: Steel Insert | Green: Deformed | Orange: Pipe Tail</text>\n",
+                     ML, H - 8.0f, x_max);
+        std::fprintf(f, "</svg></div>\n");
+    }
+
+    // SVG 2: Outer-Fiber Strain Distribution vs Allowable Limit
+    {
+        float y_top = std::max(bs.allowable_strain * 1.25f, max_strain * 1.15f) * 100.0f;
+        if (y_top < 1.0f) y_top = 8.0f;
+        const float W = 560.0f, H = 300.0f;
+        const float ML = 52.0f, MR = 20.0f, MT = 26.0f, MB = 36.0f;
+        auto sx = [&](float sv) { return ML + (sv / std::max(1e-5f, bs.length)) * (W - ML - MR); };
+        auto sy = [&](float ev_pct) { return MT + (1.0f - (ev_pct / y_top)) * (H - MT - MB); };
+
+        std::fprintf(f, "<div class=\"card\"><div style=\"font-weight:600;margin-bottom:8px;\">3.2 Outer-Fiber Polyurethane Strain Distribution &epsilon;(s) [%%]</div>\n");
+        std::fprintf(f, "<svg viewBox=\"0 0 %.0f %.0f\">\n", W, H);
+        // Allowable strain limit line
+        float y_lim = sy(bs.allowable_strain * 100.0f);
+        std::fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#ef4444\" stroke-width=\"1.8\" stroke-dasharray=\"6,4\"/>\n",
+                     ML, y_lim, W - MR, y_lim);
+        std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#ef4444\" font-size=\"11\">Allowable Limit (%.2f%%)</text>\n",
+                     W - MR - 135.0f, y_lim - 6.0f, bs.allowable_strain * 100.0f);
+        // Steel insert tip marker
+        if (bs.insert_length > 1e-4f && bs.insert_length < bs.length) {
+            float x_ins = sx(bs.insert_length);
+            std::fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#f59e0b\" stroke-dasharray=\"3,3\"/>\n",
+                         x_ins, MT, x_ins, H - MB);
+            std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#f59e0b\" font-size=\"10\">Insert Tip (%.2fm)</text>\n",
+                         x_ins + 4.0f, MT + 12.0f, bs.insert_length);
+        }
+        // Strain curve
+        std::fprintf(f, "<polyline fill=\"none\" stroke=\"#38bdf8\" stroke-width=\"2.5\" points=\"");
+        for (size_t i = 0; i < n_nodes; ++i) {
+            std::fprintf(f, "%.1f,%.1f ", sx(x_stations[i]), sy(strain_arr[i] * 100.0f));
+        }
+        std::fprintf(f, "\"/>\n");
+        std::fprintf(f, "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"4.5\" fill=\"#f59e0b\"/>\n",
+                     sx(max_strain_s), sy(max_strain * 100.0f));
+        std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#94a3b8\" font-size=\"11\">Arc Length s [m] | Peak Strain = %.2f%% at s = %.2f m</text>\n",
+                     ML, H - 8.0f, max_strain * 100.0f, max_strain_s);
+        std::fprintf(f, "</svg></div>\n");
+    }
+
+    // SVG 3: Bending Moment M(s) & Curvature kappa(s)
+    {
+        float max_m_kNm = 0.1f;
+        float max_k = 0.05f;
+        for (size_t i = 0; i < n_nodes; ++i) {
+            max_m_kNm = std::max(max_m_kNm, std::fabs(moment_Nm[i]) / 1000.0f);
+            max_k = std::max(max_k, curvature_arr[i]);
+        }
+        float k_allow = (bs.allowable_mbr_m > 1e-4f) ? (1.0f / bs.allowable_mbr_m) : 0.4f;
+        max_k = std::max(max_k * 1.15f, k_allow * 1.25f);
+
+        const float W = 560.0f, H = 300.0f;
+        const float ML = 52.0f, MR = 20.0f, MT = 26.0f, MB = 36.0f;
+        auto sx = [&](float sv) { return ML + (sv / std::max(1e-5f, bs.length)) * (W - ML - MR); };
+        auto sy_k = [&](float kv) { return MT + (1.0f - (kv / max_k)) * (H - MT - MB); };
+        auto sy_m = [&](float mv) { return MT + (1.0f - (mv / (max_m_kNm * 1.15f))) * (H - MT - MB); };
+
+        std::fprintf(f, "<div class=\"card\"><div style=\"font-weight:600;margin-bottom:8px;\">3.3 Pipe Curvature &kappa;(s) [1/m] &amp; Bending Moment |M(s)| [kN&middot;m]</div>\n");
+        std::fprintf(f, "<svg viewBox=\"0 0 %.0f %.0f\">\n", W, H);
+        float y_klim = sy_k(k_allow);
+        std::fprintf(f, "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#ef4444\" stroke-width=\"1.8\" stroke-dasharray=\"6,4\"/>\n",
+                     ML, y_klim, W - MR, y_klim);
+        std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#ef4444\" font-size=\"11\">Max Curvature 1/MBR (%.3f m⁻¹)</text>\n",
+                     W - MR - 175.0f, y_klim - 6.0f, k_allow);
+        // Curvature curve
+        std::fprintf(f, "<polyline fill=\"none\" stroke=\"#a855f7\" stroke-width=\"2.5\" points=\"");
+        for (size_t i = 0; i < n_nodes; ++i) std::fprintf(f, "%.1f,%.1f ", sx(x_stations[i]), sy_k(curvature_arr[i]));
+        std::fprintf(f, "\"/>\n");
+        // Bending moment curve
+        std::fprintf(f, "<polyline fill=\"none\" stroke=\"#22c55e\" stroke-width=\"2.0\" stroke-dasharray=\"4,2\" points=\"");
+        for (size_t i = 0; i < n_nodes; ++i) std::fprintf(f, "%.1f,%.1f ", sx(x_stations[i]), sy_m(std::fabs(moment_Nm[i]) / 1000.0f));
+        std::fprintf(f, "\"/>\n");
+        std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#94a3b8\" font-size=\"11\">Purple: Curvature &kappa;(s) (Min MBR = %.2f m) | Green Dashed: |M(s)| (M₀ = %.2f kN&middot;m)</text>\n",
+                     ML, H - 8.0f, min_mbr, std::fabs(root_moment_kNm));
+        std::fprintf(f, "</svg></div>\n");
+    }
+
+    // SVG 4: Multi-Temperature Polyurethane Stress-Strain Curves (Cold, Nominal, Hot)
+    {
+        Material m_cold = mat.with_temp_mode(MAT_TEMP_COLD);
+        Material m_nom  = mat.with_temp_mode(MAT_TEMP_NOMINAL);
+        Material m_hot  = mat.with_temp_mode(MAT_TEMP_HOT);
+        float max_eps_plot = 0.25f;
+        float max_sig_mpa = std::max(1.0f, (max_eps_plot * get_material_E(max_eps_plot, m_cold)) / 1e6f * 1.1f);
+
+        const float W = 560.0f, H = 300.0f;
+        const float ML = 52.0f, MR = 20.0f, MT = 26.0f, MB = 36.0f;
+        auto sx = [&](float ev) { return ML + (ev / max_eps_plot) * (W - ML - MR); };
+        auto sy = [&](float smpa) { return MT + (1.0f - (smpa / max_sig_mpa)) * (H - MT - MB); };
+
+        std::fprintf(f, "<div class=\"card\"><div style=\"font-weight:600;margin-bottom:8px;\">3.4 Multi-Temperature Polyurethane Stress-Strain Curves &sigma;(&epsilon;) [MPa]</div>\n");
+        std::fprintf(f, "<svg viewBox=\"0 0 %.0f %.0f\">\n", W, H);
+        const Material* mats[3] = { &m_cold, &m_nom, &m_hot };
+        const char* colors[3] = { "#38bdf8", "#22c55e", "#f97316" };
+        for (int m_i = 0; m_i < 3; ++m_i) {
+            std::fprintf(f, "<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"2.3\" points=\"", colors[m_i]);
+            for (int k = 0; k <= 40; ++k) {
+                float e = max_eps_plot * (float)k / 40.0f;
+                float s_mpa = (e * get_material_E(e, *mats[m_i])) / 1e6f;
+                std::fprintf(f, "%.1f,%.1f ", sx(e), sy(s_mpa));
+            }
+            std::fprintf(f, "\"/>\n");
+        }
+        std::fprintf(f, "<text x=\"%.1f\" y=\"%.1f\" fill=\"#94a3b8\" font-size=\"11\">Strain &epsilon; [0 to 25%%] | Blue: Cold (%.0f&deg;C) | Green: Nominal (%.0f&deg;C) | Orange: Hot (%.0f&deg;C)</text>\n",
+                     ML, H - 8.0f, mat.temp_cold_c, mat.temp_nominal_c, mat.temp_hot_c);
+        std::fprintf(f, "</svg></div>\n");
+    }
+    std::fprintf(f, "</div>\n");
+
+    // Section 4: Multi-Temperature Envelope Table
+    std::fprintf(f, "<h2>4. Multi-Temperature Envelope Verification (Cold / Nominal / Hot)</h2>\n"
+                    "<div class=\"card\"><table>\n"
+                    "<tr><th>Temperature Condition</th><th>Temp [&deg;C]</th><th>Initial E<sub>0</sub> [MPa]</th>"
+                    "<th>Peak PU Strain [%%]</th><th>Min Pipe MBR [m]</th><th>Root Moment M<sub>0</sub> [kN&middot;m]</th>"
+                    "<th>Root Shear V<sub>0</sub> [kN]</th><th>Status</th></tr>\n");
+    for (int i = 0; i < 3; ++i) {
+        const auto &r = temp_env.rows[i];
+        std::fprintf(f, "<tr><td>%s</td><td>%.1f</td><td>%.1f</td><td>%.2f%%</td><td>%.2f</td><td>%.2f</td><td>%.2f</td>"
+                        "<td><b style=\"color:%s;\">%s</b></td></tr>\n",
+                     r.label, r.temp_c, r.initial_E_mpa, r.max_strain * 100.0f, r.min_mbr_m,
+                     r.root_moment_kNm, r.root_shear_kN, r.pass ? "var(--pass)" : "var(--fail)", r.pass ? "PASS" : "FAIL");
+    }
+    std::fprintf(f, "</table></div>\n");
+
+    // Section 5: Nodal Profile Table
+    std::fprintf(f, "<h2>5. Full Nodal Solution Profile (s &isin; [0, L])</h2>\n"
+                    "<div class=\"card\"><table>\n"
+                    "<tr><th>Node</th><th>s [m]</th><th>X<sub>def</sub> [m]</th><th>Y<sub>def</sub> [m]</th>"
+                    "<th>D<sub>outer</sub> [m]</th><th>D<sub>PU,in</sub> [m]</th><th>&theta; [deg]</th>"
+                    "<th>M [kN&middot;m]</th><th>V [kN]</th><th>Strain [%%]</th><th>&kappa; [1/m]</th><th>MBR [m]</th></tr>\n");
+    for (size_t i = 0; i < n_nodes; ++i) {
+        float s = x_stations[i];
+        std::fprintf(f, "<tr><td>%zu</td><td>%.3f</td><td>%.3f</td><td>%.3f</td><td>%.3f</td><td>%.3f</td>"
+                        "<td>%.2f</td><td>%.2f</td><td>%.2f</td><td>%.2f%%</td><td>%.4f</td><td>%.2f</td></tr>\n",
+                     i, s, def_x[i], def_y[i], get_dia(bs, s), get_pu_inner_dia(bs, s),
+                     angle_rad[i] * (180.0f / 3.14159265358979323846f),
+                     moment_Nm[i] / 1000.0f, shear_N[i] / 1000.0f,
+                     strain_arr[i] * 100.0f, curvature_arr[i], mbr_arr[i]);
+    }
+    std::fprintf(f, "</table></div>\n");
+
+    std::fprintf(f, "</div>\n</body>\n</html>\n");
+    std::fclose(f);
+    return true;
+}
+
 
 
